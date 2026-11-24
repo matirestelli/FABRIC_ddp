@@ -1,0 +1,3821 @@
+"""
+Communication Strategy & AllReduce Hooks
+
+═══════════════════════════════════════════════════════════════════════════════
+BUG HISTORY
+═══════════════════════════════════════════════════════════════════════════════
+
+BUG 1 (FIXED): Cray MPICH GPU-direct RDMA stale tag cache
+──────────────────────────────────────────────────────────
+recv_bufs were receiving stale data because Cray MPICH caches RDMA buffer
+registrations per tag. Reusing tag=N on batch 2 with the same GPU address
+caused the runtime to replay the cached DMA rather than posting a fresh one.
+
+FIX: global monotonically increasing _tag_counter. Every P2POp gets a unique
+tag across the entire training run. Cray MPICH always sees a fresh tag and
+always creates a new RDMA registration.
+
+BUG 2 (FIXED): B0 hook silenced after the first backward pass
+─────────────────────────────────────────────────────────────
+SYMPTOM: [HOOK | R0|B0|C1] appeared exactly once. From batch 2 onward, B0's
+hook was never called. B1–B5 fired correctly every batch.
+
+ROOT CAUSE — two compounding issues:
+
+  1. DDP bucket rebuild after first backward.
+     PyTorch DDP profiles gradient arrival order during the first backward and
+     rebuilds bucket assignments to match real timing. This changes bucket
+     sizes (numel). RingAllreduceState keys per-bucket state by numel, so after
+     rebuild the old B0 state is orphaned and a new one is created. But more
+     fundamentally, rebuild resets DDP's internal hook dispatch for B0 in a way
+     that interacts badly with a pre-resolved or near-instantly-resolved future.
+
+  2. Pre-resolved / near-instantly-resolved future returned by the hook.
+     DDP's C++ Reducer queues finalize_backward() as an autograd engine callback
+     that runs after the full backward pass. finalize_backward() calls
+     future_work->wait() for each bucket in order (B0 first). If B0's future is
+     already resolved (scalar dummy all_reduce completes in microseconds),
+     finalize_backward processes B0 synchronously and immediately, potentially
+     before DDP's internal state machine has finished re-registering B0's
+     autograd hooks for the next iteration post-rebuild.
+
+FIX 1: static_graph=True in DDP constructor (in ddp_training.py).
+     Tells DDP the autograd graph never changes. Buckets are built once and
+     never rebuilt. B0's hook registration is permanent.
+
+FIX 2 (superseded): return a genuine async future tied to a full-size tensor.
+     This was needed when the hook was registered before the first backward,
+     because bucket rebuild caused a timing window where the last post-rebuild
+     bucket was silently dropped. The token all_reduce was a synchronous
+     barrier surrogate to paper over the mismatch.
+
+FIX 2 (current): dummy backward in ddp_training.py before register_comm_hook.
+     Triggers the DDP bucket rebuild explicitly before the hook is registered.
+     The hook sees the final stable bucket layout from the start. The token
+     all_reduce is no longer needed and has been removed — it was itself
+     introducing spurious synchronous collectives that corrupted Cray MPICH
+     GPU-direct RDMA ordering on every backward pass.
+
+═══════════════════════════════════════════════════════════════════════════════
+DDP HOOK CONTRACT
+═══════════════════════════════════════════════════════════════════════════════
+
+When NO hook is registered, DDP SUM-allreduces then divides by world_size.
+When a hook IS registered, DDP does NOT divide — the hook must produce the
+averaged gradient. Our hooks divide by world_size after the SUM.
+
+The hook MUST return a future that:
+  - Comes from dist.all_reduce(..., async_op=True).get_future()  [real Work]
+  - Resolves to bucket.buffer() — the original buffer tensor, not a clone
+
+═══════════════════════════════════════════════════════════════════════════════
+API
+═══════════════════════════════════════════════════════════════════════════════
+
+    result = get_comm_hook(backend, algorithm)
+    if result is not None:
+        hook, state = result
+        model.register_comm_hook(state=state, hook=hook)
+"""
+
+import math
+import ctypes
+import ctypes.util
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+import os
+import socket          # ← add (k-ring groups ranks by hostname)
+import threading
+
+import torch
+import torch.distributed as dist
+import contextlib
+
+try:
+    from zfp_api import (
+        ZfpCompressionConfig,
+        compress_into as _zfp_compress_into,
+        decompress_into as _zfp_decompress_into,
+        compress_into_current_stream as _zfp_compress_into_current_stream,
+        decompress_into_current_stream as _zfp_decompress_into_current_stream,
+        max_output_bytes as _zfp_max_output_bytes,
+    )
+    _ZFP_IMPORT_ERROR = None
+except Exception as exc:
+    ZfpCompressionConfig = None
+    _zfp_compress_into = None
+    _zfp_decompress_into = None
+    _zfp_compress_into_current_stream = None
+    _zfp_decompress_into_current_stream = None
+    _zfp_max_output_bytes = None
+    _ZFP_IMPORT_ERROR = exc
+
+
+# ── Diagnostic knob ──────────────────────────────────────────────────────────
+# ── Verbosity knobs ──────────────────────────────────────────────────────────
+# FULL_LOG_CALLS : first N calls get the full per-chunk trace + verify.
+# LIGHT_LOG_CALLS: calls N+1..M get a cheap one-line summary (norm + sample)
+#                  so you can watch whether the gradient is healthy over time
+#                  without the massive per-step trace that slows training.
+#                  Set to 0 to silence everything after the full-log window.
+FULL_LOG_CALLS  = 0    # heavy trace with per-step P2P + verify (as before)
+LIGHT_LOG_CALLS = 0    # lightweight one-liner after that.  0 = off.
+# ─────────────────────────────────────────────────────────────────────────────
+
+ENABLE_NVTX_PROFILING = os.getenv("DDP_PROFILE_NVTX", "0") == "1"
+
+_NVTX_LIB = None
+_NVTX_RANGE_START = None
+_NVTX_RANGE_END = None
+
+if ENABLE_NVTX_PROFILING:
+    _nvtx_path = ctypes.util.find_library("nvToolsExt")
+    if _nvtx_path is not None:
+        try:
+            _NVTX_LIB = ctypes.CDLL(_nvtx_path)
+            _NVTX_RANGE_START = _NVTX_LIB.nvtxRangeStartA
+            _NVTX_RANGE_START.argtypes = [ctypes.c_char_p]
+            _NVTX_RANGE_START.restype = ctypes.c_uint64
+            _NVTX_RANGE_END = _NVTX_LIB.nvtxRangeEnd
+            _NVTX_RANGE_END.argtypes = [ctypes.c_uint64]
+            _NVTX_RANGE_END.restype = None
+        except Exception:
+            _NVTX_LIB = None
+            _NVTX_RANGE_START = None
+            _NVTX_RANGE_END = None
+
+# profile variables for measuring communication time, so time spend in the hooks
+ENABLE_HOOK_TIMING = os.getenv("DDP_HOOK_TIMING", "0") == "1"
+HOOK_TIMING_RANK0_ONLY = os.getenv("DDP_HOOK_TIMING_RANK0_ONLY", "1") == "1"
+_HOOK_TIMING_STATS = {}
+_HOOK_TAIL_STATS = {}
+_HOOK_TIMING_LOCK = threading.Lock()
+
+
+def _record_hook_work_timing(label: str, work_ms: float) -> None:
+    if not ENABLE_HOOK_TIMING:
+        return
+    if HOOK_TIMING_RANK0_ONLY and dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+        return
+
+    try:
+        with _HOOK_TIMING_LOCK:
+            _HOOK_TIMING_STATS.setdefault(label, []).append(work_ms)
+    except Exception as exc:
+        print(f"[HOOK_TIMING] failed to record timing: {exc}", flush=True)
+
+def _record_hook_tail_timing(label: str, tail_ms: float) -> None:
+    if not ENABLE_HOOK_TIMING:
+        return
+    if HOOK_TIMING_RANK0_ONLY and dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+        return
+
+    try:
+        with _HOOK_TIMING_LOCK:
+            _HOOK_TAIL_STATS.setdefault(label, []).append(tail_ms)
+    except Exception as exc:
+        print(f"[HOOK_TIMING] failed to record tail timing: {exc}", flush=True)
+
+# Current training step — updated by ddp_training.py each batch via set_profiling_step().
+_current_epoch: int = 0
+_current_batch: int = 0
+
+# Zero the unused tail of a fixed-size compressed buffer.
+# zfp_api returns the compressed size in BYTES (verified: rate 8, n=6,553,600
+# -> 6,553,600). The old version treated it as bits and divided by 8 again,
+# zeroing 7/8 of every compressed payload before sending.
+_ZFP_SIZE_DIV = None   # 1 if zfp_api returns bytes (Polaris), 8 if bits (Frontier)
+#because missmatch in how treated zfp library in the 2 different api with cuda vs hip integration
+
+def _zfp_pad_tail_to_B_(buf_u8: torch.Tensor, used: int, B: int) -> int:
+    global _ZFP_SIZE_DIV
+    used = int(used)
+    if used <= 0:
+        raise RuntimeError(f"ZFP returned non-positive size: {used}")
+    if _ZFP_SIZE_DIV is None:
+        # Fixed-rate: real size <= B always, so used > B means the unit is bits.
+        _ZFP_SIZE_DIV = 8 if used > B else 1
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            print(f"[ZFP] size unit detected: {'bits' if _ZFP_SIZE_DIV == 8 else 'bytes'}", flush=True)
+    used_bytes = (used + _ZFP_SIZE_DIV - 1) // _ZFP_SIZE_DIV
+    if used_bytes > B:
+        raise RuntimeError(f"ZFP overflow: used_bytes={used_bytes} > B={B}")
+    if used_bytes < B:
+        buf_u8[used_bytes:B].zero_()
+    return used_bytes
+
+
+
+def set_profiling_step(epoch: int, batch: int) -> None:
+    global _current_epoch, _current_batch
+    _current_epoch, _current_batch = epoch, batch
+
+
+def _nvtx_range_push(msg: str) -> None:
+    if ENABLE_NVTX_PROFILING and torch.cuda.is_available():
+        torch.cuda.nvtx.range_push(msg)
+
+
+def _nvtx_range_pop() -> None:
+    if ENABLE_NVTX_PROFILING and torch.cuda.is_available():
+        torch.cuda.nvtx.range_pop()
+
+
+def _nvtx_process_range_start(msg: str) -> Optional[int]:
+    """Start a process-wide NVTX range that may be ended from another thread."""
+    if not ENABLE_NVTX_PROFILING or _NVTX_RANGE_START is None:
+        return None
+    return int(_NVTX_RANGE_START(msg.encode("utf-8", errors="replace")))
+
+
+def _nvtx_process_range_end(range_id: Optional[int]) -> None:
+    if range_id is not None and _NVTX_RANGE_END is not None:
+        _NVTX_RANGE_END(ctypes.c_uint64(range_id))
+
+
+# ── Per-bucket compute-window NVTX ranges ────────────────────────────────────
+# _bucket_fire_seq      = sequential bucket firing index within this backward.
+#                         B=0 is the first bucket whose hook fires, B=N last.
+# _known_num_buckets    = learned from GradBucket.is_last(), then reused.
+# _compute_range_open   = True when a "compute:B=k" range is on the stack.
+_bucket_fire_seq: int = 0
+_known_num_buckets: Optional[int] = None
+_compute_range_open: bool = False
+
+# _LAST_READY_EVENT    = CUDA event recorded when the LAST bucket's hook fires.
+#                        On the GPU timeline it is reached when the backward
+#                        compute is done but before this bucket's comm runs, so
+#                        e_start→event = compute and event→e_bwd = exposed comm.
+_LAST_READY_EVENT = None
+
+
+def pop_last_bucket_ready_event():
+    """Return and clear this iteration's last-bucket event (None if no hook ran)."""
+    global _LAST_READY_EVENT
+    ev, _LAST_READY_EVENT = _LAST_READY_EVENT, None
+    return ev
+
+
+def reset_bucket_compute_markers() -> None:
+    """Close any leftover compute range from the previous backward. Call before loss.backward()."""
+    global _bucket_fire_seq, _compute_range_open
+    if _compute_range_open:
+        _nvtx_range_pop()
+        _compute_range_open = False
+    _bucket_fire_seq = 0
+
+
+def open_first_bucket_compute_range() -> None:
+    """Open compute:B=0 on the main thread. Call after pushing the 'backward' NVTX range."""
+    global _compute_range_open
+    if ENABLE_NVTX_PROFILING:
+        _nvtx_range_push("compute:B=0")
+        _compute_range_open = True
+        
+# helper to summarize epoch time to not print each hook time each time
+def summarize_hook_timing(epoch: int) -> None:
+    if not ENABLE_HOOK_TIMING:
+        return
+    if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+        return
+
+    acquired = _HOOK_TIMING_LOCK.acquire(blocking=False)
+    if not acquired:
+        print(
+            f"[HOOK_TIMING_SUMMARY] epoch={epoch} skipped: timing lock busy",
+            flush=True,
+        )
+        return
+
+    try:
+        work_items = [
+            (label, list(values))
+            for label, values in _HOOK_TIMING_STATS.items()
+            if values
+        ]
+        tail_items = [
+            (label, list(values))
+            for label, values in _HOOK_TAIL_STATS.items()
+            if values
+        ]
+        _HOOK_TIMING_STATS.clear()
+        _HOOK_TAIL_STATS.clear()
+    finally:
+        _HOOK_TIMING_LOCK.release()
+
+    if not work_items and not tail_items:
+        print(f"[HOOK_TIMING_SUMMARY] epoch={epoch} no hook timing samples", flush=True)
+        return
+
+    print(f"\n[HOOK_TIMING_SUMMARY] epoch={epoch}", flush=True)
+
+    for label, values in sorted(work_items):
+        work_total = sum(values)
+        work_mean = work_total / len(values)
+
+        print(
+            f"[HOOK_WORK_SUMMARY] label={label} "
+            f"calls={len(values)} "
+            f"work_total_ms={work_total:.3f} "
+            f"work_mean_ms={work_mean:.3f} "
+            f"work_min_ms={min(values):.3f} "
+            f"work_max_ms={max(values):.3f}",
+            flush=True,
+        )
+
+    for label, values in sorted(tail_items):
+        tail_total = sum(values)
+        tail_mean = tail_total / len(values)
+
+        print(
+            f"[HOOK_TAIL_SUMMARY] label={label} "
+            f"steps={len(values)} "
+            f"tail_total_ms={tail_total:.3f} "
+            f"tail_mean_ms={tail_mean:.3f} "
+            f"tail_min_ms={min(values):.3f} "
+            f"tail_max_ms={max(values):.3f}",
+            flush=True,
+        )
+
+def _profiled_hook(label: str, hook_fn, state, bucket: dist.GradBucket):
+    global _bucket_fire_seq, _known_num_buckets, _compute_range_open, _LAST_READY_EVENT
+    tensor = bucket.buffer()
+    numel = tensor.numel()
+    epoch, batch = _current_epoch, _current_batch
+    rank = dist.get_rank()
+    hook_dispatch_time = time.perf_counter()
+
+    b_idx = _bucket_fire_seq
+    _bucket_fire_seq += 1
+    is_last_bucket = False
+    bucket_is_last = getattr(bucket, "is_last", None)
+    if callable(bucket_is_last):
+        is_last_bucket = bool(bucket_is_last())
+
+    if is_last_bucket:
+        _known_num_buckets = b_idx + 1
+    elif _known_num_buckets is not None:
+        is_last_bucket = b_idx == _known_num_buckets - 1
+        
+    # GPU-side marker for "backward compute done, this bucket's comm not yet run".
+    # Must be recorded BEFORE hook_fn queues any of its own work below.
+    if is_last_bucket and tensor.is_cuda:
+        ev = torch.cuda.Event(enable_timing=True)
+        ev.record(torch.cuda.current_stream(tensor.device))
+        _LAST_READY_EVENT = ev
+
+    if _compute_range_open:
+        _nvtx_range_pop()
+        _compute_range_open = False
+
+    _nvtx_range_push(
+        f"hook_called:{label} B={b_idx} epoch={epoch} batch={batch} numel={numel}"
+    )
+    try:
+        fut = hook_fn(state, bucket)
+    finally:
+        _nvtx_range_pop()
+
+    if ENABLE_NVTX_PROFILING and not is_last_bucket:
+        _nvtx_range_push(f"compute:B={b_idx + 1}")
+        _compute_range_open = True
+
+    def _on_done(f):
+        _nvtx_range_push(
+            f"comm_done:{label} B={b_idx} epoch={epoch} batch={batch}"
+        )
+        result = f.value()
+        _nvtx_range_pop()
+        
+        if is_last_bucket:
+            tail_ms = (time.perf_counter() - hook_dispatch_time) * 1000.0
+            _record_hook_tail_timing(label, tail_ms)
+            
+        return result
+
+    return fut.then(_on_done)
+
+# ── Global monotonic tag counter ─────────────────────────────────────────────
+# Each P2POp gets a unique tag. Never reused → no RDMA cache reuse.
+# One counter per process (MPI rank = OS process, no sharing needed).
+_tag_counter: int = 0
+_TAG_UB = 8388607
+def _next_tag() -> int:
+    global _tag_counter
+    t = _tag_counter % (_TAG_UB + 1)
+    _tag_counter += 1
+    return t
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Background worker for async ring hook ─────────────────────────────────────
+# One worker preserves the same P2P/tag order as the synchronous ring hook while
+# allowing DDP's main/autograd thread to continue after returning the Future.
+_COMM_HOOK_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="ddp-comm-hook",
+)
+
+_WORKER_STREAMS: Dict[int, torch.cuda.Stream] = {}
+
+def _submit_async_hook_work(label, tensor, work_fn):
+    fut = torch.futures.Future()
+    device_index = tensor.device.index if tensor.is_cuda else None
+
+    # Recorded on the autograd thread at hook time: marks "this bucket's grads are ready".
+    ready_ev = None
+    if tensor.is_cuda:
+        ready_ev = torch.cuda.Event()
+        ready_ev.record(torch.cuda.current_stream(tensor.device))
+
+    def _worker():
+        try:
+            if device_index is None:
+                work_fn()
+                fut.set_result(tensor)
+                return
+            torch.cuda.set_device(device_index)
+            stream = _WORKER_STREAMS.get(device_index)
+            if stream is None:
+                stream = torch.cuda.Stream(device=device_index)
+                _WORKER_STREAMS[device_index] = stream
+
+            work_start = time.perf_counter()
+            _nvtx_range_push(f"comm_work:{label}")
+            try:
+                with torch.cuda.stream(stream):
+                    stream.wait_event(ready_ev)   # wait for THIS bucket only
+                    work_fn()
+                stream.synchronize()              # our work only, not backward
+            finally:
+                _nvtx_range_pop()
+            _record_hook_work_timing(label, (time.perf_counter() - work_start) * 1000.0)
+            fut.set_result(tensor)
+        except BaseException as exc:
+            fut.set_exception(exc)
+
+    _COMM_HOOK_EXECUTOR.submit(_worker)
+    return fut
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ── Tensor snippet formatter ──────────────────────────────────────────────────
+def _fmt(t: torch.Tensor) -> str:
+    """Print first 4 elements plus how many more exist."""
+    n      = t.numel()
+    sample = t.flatten()[:4].tolist()
+    extra  = n - len(sample)
+    return f"{sample} ... ({extra} more elements)" if extra > 0 else f"{sample}"
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DEFAULT HOOKS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _default_allreduce_hook(
+    state: Optional[object],
+    bucket: dist.GradBucket,
+) -> torch.futures.Future[torch.Tensor]:
+    """Baseline — dist.all_reduce with pre-division."""
+    tensor = bucket.buffer()
+    backend = dist.get_backend()
+    rank = dist.get_rank()
+    numel = tensor.numel()
+
+    label = f"{backend}:default"
+
+    tensor.div_(dist.get_world_size())
+
+    _nvtx_range_push(
+        f"allreduce_launched backend={backend} rank={rank} "
+        f"bucket={bucket.index()} numel={numel}"
+    )
+    _nvtx_range_pop()
+
+    range_id = _nvtx_process_range_start(
+        f"async_allreduce:{backend} rank={rank} bucket={bucket.index()} numel={numel}"
+    )
+
+    work_start = time.perf_counter()
+    fut = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True).get_future()
+
+    def _finish(f):
+        work_ms = (time.perf_counter() - work_start) * 1000.0
+        _record_hook_work_timing(label, work_ms)
+
+        _nvtx_process_range_end(range_id)
+        return f.value()[0]
+
+    return fut.then(_finish)
+
+# Hook alias: baseline PyTorch-style allreduce using dist.all_reduce.
+nccl_default_allreduce_hook = _default_allreduce_hook
+mpi_default_allreduce_hook = _default_allreduce_hook
+
+def _default_allreduce_sync_hook(state, bucket):
+    """Baseline: MPI_Allreduce with the stream synchronized first.
+
+    PyTorch's MPI backend calls MPI_Allreduce from a background thread and does
+    NOT wait for queued GPU work (pytorch#38642, open since 2020). Without the
+    wait below, GTL reads the bucket while the gradients and the div_ are still
+    being written: ranks then disagree on ~99% of iterations and gradients grow
+    ~4x per step until they overflow to NaN. This is the correct baseline to use
+    instead of the built-in path (hook=none), which has no such wait.
+    """
+    t = bucket.buffer()
+    label = f"{dist.get_backend()}:default_sync"
+
+    t.div_(dist.get_world_size())
+
+    if t.is_cuda:
+        # Everything this bucket depends on is on the current stream, so the
+        # stream-level wait is enough; no need for a device-wide synchronize.
+        torch.cuda.current_stream(device=t.device).synchronize()
+
+    work_start = time.perf_counter()
+    fut = dist.all_reduce(t, op=dist.ReduceOp.SUM, async_op=True).get_future()
+
+    def _finish(f):
+        out = f.value()[0]
+        _record_hook_work_timing(label, (time.perf_counter() - work_start) * 1000.0)
+        return out
+
+    return fut.then(_finish)
+
+def _default_allreduce_clone_hook(
+    state: Optional[object],
+    bucket: dist.GradBucket,
+    ) -> torch.futures.Future[torch.Tensor]:
+    """Diagnostic default hook: allreduce a fresh cloned GPU tensor."""
+    tensor = bucket.buffer()
+    backend = dist.get_backend()
+    rank = dist.get_rank()
+    numel = tensor.numel()
+    label = f"{backend}:default_clone"
+
+    if not torch.isfinite(tensor).all():
+        raise RuntimeError(
+            f"[Rank {rank}] bucket {bucket.index()} non-finite BEFORE clone allreduce"
+        )
+
+    tmp = tensor.detach().clone()
+    tmp.div_(dist.get_world_size())
+
+    if tmp.is_cuda:
+        torch.cuda.synchronize(tmp.device)
+
+    work_start = time.perf_counter()
+    fut = dist.all_reduce(tmp, op=dist.ReduceOp.SUM, async_op=True).get_future()
+
+    def _finish(f):
+        out = f.value()[0]
+
+        if not torch.isfinite(out).all():
+            raise RuntimeError(
+                f"[Rank {rank}] bucket {bucket.index()} non-finite AFTER clone allreduce"
+            )
+
+        tensor.copy_(out)
+
+        work_ms = (time.perf_counter() - work_start) * 1000.0
+        _record_hook_work_timing(label, work_ms)
+
+        return tensor
+
+    return fut.then(_finish)
+
+def _default_allreduce_cpu_stage_hook(
+    state: Optional[object],
+    bucket: dist.GradBucket,
+    ) -> torch.futures.Future[torch.Tensor]:
+    """Diagnostic default hook: stage bucket through CPU before MPI allreduce."""
+    tensor = bucket.buffer()
+    backend = dist.get_backend()
+    rank = dist.get_rank()
+    label = f"{backend}:default_cpu_stage"
+
+    if not torch.isfinite(tensor).all():
+        raise RuntimeError(
+            f"[Rank {rank}] bucket {bucket.index()} non-finite BEFORE cpu-stage allreduce"
+        )
+
+    work_start = time.perf_counter()
+
+    cpu = tensor.detach().cpu()
+    dist.all_reduce(cpu, op=dist.ReduceOp.SUM)
+    cpu.div_(dist.get_world_size())
+    tensor.copy_(cpu.to(tensor.device, non_blocking=False))
+
+    work_ms = (time.perf_counter() - work_start) * 1000.0
+    _record_hook_work_timing(label, work_ms)
+
+    if not torch.isfinite(tensor).all():
+        raise RuntimeError(
+            f"[Rank {rank}] bucket {bucket.index()} non-finite AFTER cpu-stage allreduce"
+        )
+
+    fut = torch.futures.Future()
+    fut.set_result(tensor)
+    return fut
+
+nccl_default_sync_allreduce_hook = _default_allreduce_sync_hook
+mpi_default_sync_allreduce_hook = _default_allreduce_sync_hook
+
+nccl_default_clone_allreduce_hook = _default_allreduce_clone_hook
+mpi_default_clone_allreduce_hook = _default_allreduce_clone_hook
+
+nccl_default_cpu_stage_allreduce_hook = _default_allreduce_cpu_stage_hook
+mpi_default_cpu_stage_allreduce_hook = _default_allreduce_cpu_stage_hook
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RING ALLREDUCE — state
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class RingBucketState:
+    """Persistent GPU buffers for one DDP bucket."""
+    flat:       Optional[torch.Tensor] = None
+    send_bufs:  List[torch.Tensor]     = field(default_factory=list)
+    recv_bufs:  List[torch.Tensor]     = field(default_factory=list)
+    cnts:       List[int]              = field(default_factory=list)
+    displs:     List[int]              = field(default_factory=list)
+    bucket_id:  int                    = 0
+    call_count: int                    = 0
+    ready:      bool                   = False
+    token:      Optional[torch.Tensor] = None  
+    stream:     Optional[torch.cuda.Stream] = None   # ADD: private stream for this bucket's copies
+
+    def initialize(self, tensor: torch.Tensor, world_size: int,
+                   bucket_id: int) -> None:
+        numel      = tensor.numel()
+        base_chunk = math.ceil(numel / world_size)
+
+        total = 0
+        self.cnts = []
+        for i in range(world_size):
+            c = min(base_chunk, numel - total)
+            self.cnts.append(max(c, 0))
+            total += self.cnts[-1]
+
+        self.displs = [0]
+        for i in range(1, world_size):
+            self.displs.append(self.displs[-1] + self.cnts[i - 1])
+
+        self.flat      = torch.empty(numel, dtype=tensor.dtype, device=tensor.device)
+        self.send_bufs = [
+            torch.empty(self.cnts[i], dtype=tensor.dtype, device=tensor.device)
+            for i in range(world_size)
+        ]
+        self.recv_bufs = [
+            torch.empty(self.cnts[i], dtype=tensor.dtype, device=tensor.device)
+            for i in range(world_size)
+        ]
+        self.bucket_id = bucket_id
+        
+        # ADD: private stream so our copies don't queue behind (and wait for)
+        # the backward kernels the autograd engine keeps putting on the default
+        # stream while this hook runs on the worker thread.
+        self.stream = (torch.cuda.Stream(device=tensor.device)
+                       if tensor.is_cuda else None)
+        self.ready     = True
+        
+        self.ready     = True
+
+
+@dataclass
+class RingAllreduceState:
+    """
+    Per-bucket ring state, keyed by DDP bucket index.
+
+    Keying by bucket.index() (not numel) is important: after DDP's first-backward
+    bucket rebuild, bucket sizes may change. Keying by index means each logical
+    bucket position always maps to the same state slot, and initialize() is called
+    again if the tensor shape changed (detected by numel mismatch vs flat buffer).
+    """
+    buckets: Dict[int, RingBucketState] = field(default_factory=dict)
+
+    def get_or_init(self, bucket_index: int,
+                    tensor: torch.Tensor, world_size: int) -> RingBucketState:
+        bs = self.buckets.get(bucket_index)
+        if bs is None or bs.flat is None or bs.flat.numel() != tensor.numel():
+            # First call for this bucket, or numel changed after DDP rebuild —
+            # (re)initialize the persistent GPU buffers.
+            if bs is not None and bs.flat is not None:
+                pass  # numel changed after DDP bucket rebuild — reinitializing
+                # old_numel = bs.flat.numel()
+                # print(f"[RING STATE] bucket_index={bucket_index} reinitializing: "
+                #       f"numel changed {old_numel} → {tensor.numel()} "
+                #       f"(DDP bucket rebuild detected)", flush=True)
+            bs = RingBucketState()
+            bs.initialize(tensor, world_size, bucket_index)
+            self.buckets[bucket_index] = bs
+        return bs
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RING ALLREDUCE — algorithm
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _cuda_sync(t: torch.Tensor) -> None:
+    """Drain the current CUDA stream so every preceding kernel has finished.
+
+    GPU-direct RDMA (Cray MPICH with MPICH_GPU_SUPPORT_ENABLED=1) reads GPU
+    memory via PCIe DMA, which bypasses CUDA stream ordering.  A CUDA copy_()
+    into a send buffer is an async kernel; if MPI initiates the DMA before
+    that kernel lands, it sends stale data.  This one-liner guarantees the
+    buffer is ready before MPI touches it.
+
+    Why C1/C2 appeared correct without this: the full-log code path calls
+    .tolist() (device→host copy = implicit stream sync) right before every
+    batch_isend_irecv.  C3+ skipped logging → no sync → stale reads →
+    MISMATCH.
+    """
+    if t.is_cuda:
+        torch.cuda.current_stream(device=t.device).synchronize()
+
+
+def _cuda_device_sync(t: torch.Tensor) -> None:
+    """Full-device sync for external CUDA libraries not stream-ordered with PyTorch."""
+    if t.is_cuda:
+        torch.cuda.synchronize(device=t.device)
+        
+def _ring_sync(bstate, t: torch.Tensor) -> None:
+    """Wait for the bucket's private stream (falls back to the current stream).
+
+    Used instead of _cuda_sync inside the ring / recursive-doubling bodies: the
+    copies now run on bstate.stream, so we must wait for THAT stream, and only
+    for it — not for backward kernels the autograd engine is still queueing on
+    the default stream.
+    """
+    if not t.is_cuda:
+        return
+    stream = getattr(bstate, "stream", None)
+    if stream is not None:
+        stream.synchronize()
+    else:
+        torch.cuda.current_stream(device=t.device).synchronize()
+
+
+def _require_zfp_cuda() -> None:
+    if _ZFP_IMPORT_ERROR is not None:
+        raise RuntimeError(
+            "ZFP CUDA support is unavailable. Build/runtime error while importing "
+            "`zfp_cuda.py`. Ensure libzfp with CUDA support is installed and "
+            "`ZFP_HOME` is set if needed."
+        ) from _ZFP_IMPORT_ERROR
+
+def _ring_allreduce_sum(tensor: torch.Tensor, bstate: RingBucketState,
+                        log: bool, call_n: int = 0) -> None:
+    """
+    In-place ring allreduce with monotonically increasing tags.
+
+    Every P2POp gets a fresh unique tag via _next_tag(). This guarantees
+    Cray MPICH creates a new RDMA registration for every operation and
+    never reuses a stale cached mapping.
+
+    All ranks call _next_tag() the same number of times in the same order
+    within each hook invocation, so send/recv tags always match.
+    """
+    rank       = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    if world_size == 1:
+        return
+
+    pfx = f"[R{rank}|B{bstate.bucket_id}|C{call_n}]"
+
+    # Everything below runs on the bucket's private stream. wait_stream makes it
+    # wait ONCE for the gradients (and DDP's copy into the bucket), which are
+    # produced on the default stream; after that our per-step syncs wait only for
+    # our own copies, not for unrelated backward compute.
+    _ring_stream = bstate.stream if tensor.is_cuda else None
+    if _ring_stream is not None:
+        _ring_stream.wait_stream(torch.cuda.current_stream(device=tensor.device))
+    _ring_ctx = (torch.cuda.stream(_ring_stream) if _ring_stream is not None
+                 else contextlib.nullcontext())
+
+    with _ring_ctx:
+        bstate.flat.copy_(tensor.flatten())
+
+        chunks = [
+            bstate.flat[bstate.displs[i]: bstate.displs[i] + bstate.cnts[i]]
+            for i in range(world_size)
+        ]
+
+        src = (rank - 1 + world_size) % world_size
+        dst = (rank + 1) % world_size
+
+        if log:
+            print(f"{pfx} flat after copy from tensor: {_fmt(bstate.flat)}", flush=True)
+            for i in range(world_size):
+                owned = " <-- OWNED" if i == rank else ""
+                print(f"{pfx}   chunk[{i}] displ={bstate.displs[i]} "
+                    f"cnt={bstate.cnts[i]}{owned}: {_fmt(chunks[i])}", flush=True)
+
+        # ── Phase 1: Reduce-scatter ───────────────────────────────────────────────
+        _nvtx_range_push(f"ring_reduce_scatter:B{bstate.bucket_id} rank={rank}")
+        for step in range(world_size - 1):
+            send_idx = (rank - step - 1 + world_size) % world_size
+            recv_idx = (rank - step - 2 + world_size) % world_size
+
+            # Fresh unique tag — Cray MPICH will never reuse a cached registration
+            tag = _next_tag()
+
+            bstate.send_bufs[send_idx].copy_(chunks[send_idx])
+            _nvtx_range_push(f"cuda_sync_pre_mpi:B{bstate.bucket_id} phase=1 step={step}")
+            _ring_sync(bstate, bstate.send_bufs[send_idx])
+            _nvtx_range_pop()
+
+            if log:
+                print(f"{pfx} P1 step={step} tag={tag} "
+                    f"SENDING chunk[{send_idx}]→rank{dst}: {_fmt(bstate.send_bufs[send_idx])} | "
+                    f"EXPECTING recv chunk[{recv_idx}]←rank{src}", flush=True)
+
+            reqs = dist.batch_isend_irecv([
+                dist.P2POp(dist.irecv, bstate.recv_bufs[recv_idx], src, tag=tag),
+                dist.P2POp(dist.isend, bstate.send_bufs[send_idx], dst, tag=tag),
+            ])
+            for req in reqs:
+                req.wait()
+
+            before = chunks[recv_idx][:4].tolist() if log else None
+            chunks[recv_idx].add_(bstate.recv_bufs[recv_idx])
+
+            if log:
+                print(f"{pfx} P1 step={step} RECVD chunk[{recv_idx}]←rank{src}: "
+                    f"{_fmt(bstate.recv_bufs[recv_idx])}", flush=True)
+                print(f"{pfx}   chunk[{recv_idx}] before_add={before} "
+                    f"after_add={chunks[recv_idx][:4].tolist()} "
+                    f"... ({bstate.cnts[recv_idx] - 4} more elements)", flush=True)
+
+        if log:
+            print(f"{pfx} === AFTER Phase 1 (reduce-scatter) ===", flush=True)
+            for i in range(world_size):
+                owned = " <-- fully reduced" if i == rank else ""
+                print(f"{pfx}   chunk[{i}]{owned}: {_fmt(chunks[i])}", flush=True)
+
+        _nvtx_range_pop()  # ring_reduce_scatter
+
+        # ── Phase 2: Allgather ────────────────────────────────────────────────────
+        _nvtx_range_push(f"ring_allgather:B{bstate.bucket_id} rank={rank}")
+        for step in range(world_size - 1):
+            send_idx = (rank - step     + world_size) % world_size
+            recv_idx = (rank - step - 1 + world_size) % world_size
+
+            tag = _next_tag()
+
+            bstate.send_bufs[send_idx].copy_(chunks[send_idx])
+            _nvtx_range_push(f"cuda_sync_pre_mpi:B{bstate.bucket_id} phase=2 step={step}")
+            _ring_sync(bstate, bstate.send_bufs[send_idx])
+            _nvtx_range_pop()
+
+            if log:
+                print(f"{pfx} P2 step={step} tag={tag} "
+                    f"SENDING chunk[{send_idx}]→rank{dst}: {_fmt(bstate.send_bufs[send_idx])} | "
+                    f"EXPECTING recv chunk[{recv_idx}]←rank{src}", flush=True)
+
+            reqs = dist.batch_isend_irecv([
+                dist.P2POp(dist.irecv, bstate.recv_bufs[recv_idx], src, tag=tag),
+                dist.P2POp(dist.isend, bstate.send_bufs[send_idx], dst, tag=tag),
+            ])
+            for req in reqs:
+                req.wait()
+
+            chunks[recv_idx].copy_(bstate.recv_bufs[recv_idx])
+
+            if log:
+                print(f"{pfx} P2 step={step} RECVD chunk[{recv_idx}]←rank{src}: "
+                    f"{_fmt(bstate.recv_bufs[recv_idx])}", flush=True)
+                print(f"{pfx}   chunk[{recv_idx}] now={chunks[recv_idx][:4].tolist()} "
+                    f"... ({bstate.cnts[recv_idx] - 4} more elements)", flush=True)
+
+        if log:
+            print(f"{pfx} === AFTER Phase 2 (allgather) ===", flush=True)
+            for i in range(world_size):
+                print(f"{pfx}   chunk[{i}]: {_fmt(chunks[i])}", flush=True)
+
+        _nvtx_range_pop()  # ring_allgather
+
+        tensor.copy_(bstate.flat.view_as(tensor))
+        tensor.div_(world_size)
+    _nvtx_range_push(f"cuda_sync_post_ring:B{bstate.bucket_id} rank={rank}")
+    _ring_sync(bstate, tensor)   # ensure div_ has landed before hook resolves the future
+    _nvtx_range_pop()
+
+# Hook: plain ring allreduce with no compression.
+def _ring_allreduce_hook(
+    state:  RingAllreduceState,
+    bucket: dist.GradBucket,
+) -> torch.futures.Future[torch.Tensor]:
+    tensor       = bucket.buffer()
+    world_size   = dist.get_world_size()
+    rank         = dist.get_rank()
+    numel        = tensor.numel()
+    bucket_index = bucket.index()   # DDP's logical bucket index, stable across rebuild
+
+    bstate = state.get_or_init(bucket_index, tensor, world_size)
+    bstate.call_count += 1
+    call_n = bstate.call_count
+
+    do_full_log  = (FULL_LOG_CALLS  > 0 and call_n <= FULL_LOG_CALLS)
+    do_light_log = (not do_full_log and LIGHT_LOG_CALLS > 0
+                    and call_n <= LIGHT_LOG_CALLS)
+
+    # # Unconditional — fires on every hook invocation regardless of log knobs.
+    # # Use this to verify all buckets fire on every backward pass.
+    # print(f"[HOOK | R{rank}|B{bstate.bucket_id}|C{call_n}|numel={numel}]",
+    #       flush=True)
+
+    # ── Snapshot for verification (full or light) ────────────────────────
+    if do_full_log or do_light_log:
+        pre = tensor.clone()
+
+    if do_full_log:
+        tid = threading.get_ident()
+        print(f"\n[RING | R{rank}|B{bstate.bucket_id}|C{call_n}] "
+              f"thread={tid} global_tag_before={_tag_counter} numel={numel}", flush=True)
+        print(f"  [R{rank}] INPUT tensor: {_fmt(tensor)}", flush=True)
+        for i in range(world_size):
+            print(f"  [R{rank}] chunk[{i}]: displ={bstate.displs[i]} cnt={bstate.cnts[i]}", flush=True)
+        print(f"  [R{rank}] flat.data_ptr={hex(bstate.flat.data_ptr())}", flush=True)
+        for i in range(world_size):
+            print(f"  [R{rank}] send_bufs[{i}].data_ptr={hex(bstate.send_bufs[i].data_ptr())} "
+                  f"recv_bufs[{i}].data_ptr={hex(bstate.recv_bufs[i].data_ptr())}", flush=True)
+
+    _nvtx_range_push(f"bucket_grads_ready:B{bucket_index} rank={rank} call={call_n}")
+    _nvtx_range_pop()
+    def _work() -> None:
+        _ring_allreduce_sum(
+            tensor,
+            bstate,
+            log=do_full_log,
+            call_n=call_n,
+        )
+
+    return _submit_async_hook_work(f"{dist.get_backend()}:ring", tensor, _work)
+
+
+# Hook aliases: plain ring allreduce with no compression.
+nccl_ring_allreduce_hook = _ring_allreduce_hook
+mpi_ring_allreduce_hook  = _ring_allreduce_hook
+
+#ring async hook try 1 
+
+# def _ring_allreduce_async_hook(
+#     state: RingAllreduceState,
+#     bucket: dist.GradBucket,
+# ) -> torch.futures.Future[torch.Tensor]:
+#     """
+#     Async wrapper for the plain ring allreduce.
+#
+#     The hook immediately returns an unresolved Future. A single background
+#     worker thread runs the existing ring implementation and resolves the Future
+#     when communication is complete.
+#     """
+#     tensor = bucket.buffer()
+#     world_size = dist.get_world_size()
+#     rank = dist.get_rank()
+#     numel = tensor.numel()
+#     bucket_index = bucket.index()
+#
+#     bstate = state.get_or_init(bucket_index, tensor, world_size)
+#     bstate.call_count += 1
+#     call_n = bstate.call_count
+#
+#     do_full_log = (FULL_LOG_CALLS > 0 and call_n <= FULL_LOG_CALLS)
+#
+#     fut: torch.futures.Future[torch.Tensor] = torch.futures.Future()
+#     device_index = tensor.device.index if tensor.is_cuda else None
+#
+#     if do_full_log:
+#         print(
+#             f"\n[RING_ASYNC | R{rank}|B{bstate.bucket_id}|C{call_n}] "
+#             f"numel={numel} submit_thread={threading.get_ident()} "
+#             f"global_tag_before={_tag_counter}",
+#             flush=True,
+#         )
+#
+#     def _worker() -> None:
+#         try:
+#             if device_index is not None:
+#                 torch.cuda.set_device(device_index)
+#
+#             if do_full_log:
+#                 print(
+#                     f"[RING_ASYNC | R{rank}|B{bstate.bucket_id}|C{call_n}] "
+#                     f"worker_thread={threading.get_ident()}",
+#                     flush=True,
+#                 )
+#
+#             work_start = time.perf_counter()
+#
+#             _ring_allreduce_sum(
+#                 tensor,
+#                 bstate,
+#                 log=do_full_log,
+#                 call_n=call_n,
+#             )
+#
+#             _cuda_sync(tensor)
+#
+#             work_ms = (time.perf_counter() - work_start) * 1000.0
+#             _record_hook_work_timing("mpi:ring_async", work_ms)
+#
+#             fut.set_result(tensor)
+#
+#         except BaseException as exc:
+#             fut.set_exception(exc)
+#
+#     _RING_ASYNC_EXECUTOR.submit(_worker)
+#     return fut
+#
+# #aliases
+# mpi_ring_async_allreduce_hook = _ring_allreduce_async_hook
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RECURSIVE DOUBLING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class RecursiveDoublingBucketState:
+    """Persistent GPU buffers for one DDP bucket."""
+    flat:       Optional[torch.Tensor] = None
+    tmp:        Optional[torch.Tensor] = None
+    bucket_id:  int                    = 0
+    call_count: int                    = 0
+    stream:     Optional[torch.cuda.Stream] = None   # private stream for this bucket's copies
+
+
+    def initialize(self, tensor: torch.Tensor, bucket_id: int) -> None:
+        numel = tensor.numel()
+        self.flat = torch.empty(numel, dtype=tensor.dtype, device=tensor.device)
+        self.tmp = torch.empty_like(self.flat)
+        self.bucket_id = bucket_id
+        # Private stream: our copies don't queue behind (and wait for) backward
+        # kernels the autograd engine keeps putting on the default stream.
+        self.stream = (torch.cuda.Stream(device=tensor.device)
+                       if tensor.is_cuda else None)
+
+
+@dataclass
+class RecursiveDoublingAllreduceState:
+    """Per-bucket recursive doubling state, keyed by DDP bucket index."""
+    buckets: Dict[int, RecursiveDoublingBucketState] = field(default_factory=dict)
+
+    def get_or_init(self, bucket_index: int,
+                    tensor: torch.Tensor) -> RecursiveDoublingBucketState:
+        bs = self.buckets.get(bucket_index)
+        if bs is None or bs.flat is None or bs.flat.numel() != tensor.numel():
+            bs = RecursiveDoublingBucketState()
+            bs.initialize(tensor, bucket_index)
+            self.buckets[bucket_index] = bs
+        return bs
+
+
+def _recursive_doubling_allreduce_sum(
+    tensor: torch.Tensor,
+    bstate: RecursiveDoublingBucketState,
+    log: bool,
+    call_n: int = 0,
+) -> None:
+    """
+    In-place recursive doubling allreduce with monotonically increasing tags.
+
+    The non-power-of-two case follows the MPICH structure:
+      1. peel off the first 2*rem ranks into even/odd pairs,
+      2. recursive-double across the surviving power-of-two ranks,
+      3. send the final result back to the peeled even ranks.
+
+    All ranks consume the same number of _next_tag() calls in the same order,
+    even when a rank is inactive for a phase, so future hook invocations stay
+    tag-aligned across the job.
+    """
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    if world_size == 1:
+        return
+
+    pfx = f"[R{rank}|B{bstate.bucket_id}|C{call_n}]"
+
+    assert bstate.flat is not None
+    assert bstate.tmp is not None
+    work = bstate.flat
+    tmp = bstate.tmp
+
+    # Everything below runs on the bucket's private stream. wait_stream makes it
+    # wait ONCE for the gradients (and DDP's copy into the bucket), which are
+    # produced on the default stream; after that our per-phase syncs wait only
+    # for our own copies, not for unrelated backward compute.
+    _rd_stream = bstate.stream if tensor.is_cuda else None
+    if _rd_stream is not None:
+        _rd_stream.wait_stream(torch.cuda.current_stream(device=tensor.device))
+    _rd_ctx = (torch.cuda.stream(_rd_stream) if _rd_stream is not None
+               else contextlib.nullcontext())
+
+    with _rd_ctx:
+        work.copy_(tensor.flatten())
+
+        if log:
+            print(f"{pfx} flat after copy from tensor: {_fmt(work)}", flush=True)
+
+        pof2 = 1
+        while pof2 <= world_size:
+            pof2 <<= 1
+        pof2 >>= 1
+        rem = world_size - pof2
+
+        newrank = -1
+
+        _nvtx_range_push(f"recursive_doubling_peel:B{bstate.bucket_id} rank={rank}")
+        peel_tag = _next_tag()
+        if rank < 2 * rem:
+            partner = rank + 1 if rank % 2 == 0 else rank - 1
+            _nvtx_range_push(f"cuda_sync_pre_mpi:B{bstate.bucket_id} phase=peel")
+            _ring_sync(bstate, work)
+            _nvtx_range_pop()
+            if rank % 2 == 0:
+                if log:
+                    print(f"{pfx} peel tag={peel_tag} SENDING -> rank{partner}: {_fmt(work)}",
+                        flush=True)
+                req = dist.isend(work, dst=partner, tag=peel_tag)
+                req.wait()
+                newrank = -1
+            else:
+                if log:
+                    print(f"{pfx} peel tag={peel_tag} EXPECTING <- rank{partner}",
+                        flush=True)
+                req = dist.irecv(tmp, src=partner, tag=peel_tag)
+                req.wait()
+                work.add_(tmp)
+                newrank = rank // 2
+                if log:
+                    print(f"{pfx} peel tag={peel_tag} RECVD <- rank{partner}: {_fmt(tmp)}",
+                        flush=True)
+                    print(f"{pfx}   after peel add: {_fmt(work)}", flush=True)
+        else:
+            newrank = rank - rem
+        _nvtx_range_pop()
+
+        _nvtx_range_push(f"recursive_doubling_main:B{bstate.bucket_id} rank={rank}")
+        mask = 1
+        while mask < pof2:
+            step_tag = _next_tag()
+            if newrank != -1:
+                newdst = newrank ^ mask
+                dst = (newdst << 1) + 1 if newdst < rem else newdst + rem
+
+                _nvtx_range_push(
+                    f"cuda_sync_pre_mpi:B{bstate.bucket_id} phase=main mask={mask}"
+                )
+                _ring_sync(bstate, work)
+                _nvtx_range_pop()
+
+                if log:
+                    print(f"{pfx} main mask={mask} tag={step_tag} "
+                        f"SENDRECV <-> rank{dst}: {_fmt(work)}", flush=True)
+
+                reqs = dist.batch_isend_irecv([
+                    dist.P2POp(dist.irecv, tmp, dst, tag=step_tag),
+                    dist.P2POp(dist.isend, work, dst, tag=step_tag),
+                ])
+                for req in reqs:
+                    req.wait()
+
+                work.add_(tmp)
+
+                if log:
+                    print(f"{pfx} main mask={mask} tag={step_tag} "
+                        f"RECVD <- rank{dst}: {_fmt(tmp)}", flush=True)
+                    print(f"{pfx}   after main add: {_fmt(work)}", flush=True)
+            mask <<= 1
+        _nvtx_range_pop()
+
+        _nvtx_range_push(f"recursive_doubling_finalize:B{bstate.bucket_id} rank={rank}")
+        final_tag = _next_tag()
+        if rank < 2 * rem:
+            partner = rank - 1 if rank % 2 else rank + 1
+            _nvtx_range_push(f"cuda_sync_pre_mpi:B{bstate.bucket_id} phase=final")
+            _ring_sync(bstate, work)
+            _nvtx_range_pop()
+            if rank % 2:
+                if log:
+                    print(f"{pfx} final tag={final_tag} SENDING -> rank{partner}: {_fmt(work)}",
+                        flush=True)
+                req = dist.isend(work, dst=partner, tag=final_tag)
+                req.wait()
+            else:
+                if log:
+                    print(f"{pfx} final tag={final_tag} EXPECTING <- rank{partner}",
+                        flush=True)
+                req = dist.irecv(work, src=partner, tag=final_tag)
+                req.wait()
+                if log:
+                    print(f"{pfx} final tag={final_tag} RECVD <- rank{partner}: {_fmt(work)}",
+                        flush=True)
+        _nvtx_range_pop()
+
+        tensor.copy_(work.view_as(tensor))
+        tensor.div_(world_size)
+    _nvtx_range_push(f"cuda_sync_post_recursive_doubling:B{bstate.bucket_id} rank={rank}")
+    _ring_sync(bstate, tensor)
+    _nvtx_range_pop()
+
+# Hook: plain recursive-doubling allreduce with no compression.
+def _recursive_doubling_allreduce_hook(
+    state:  RecursiveDoublingAllreduceState,
+    bucket: dist.GradBucket,
+) -> torch.futures.Future[torch.Tensor]:
+    tensor = bucket.buffer()
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    numel = tensor.numel()
+    bucket_index = bucket.index()
+
+    bstate = state.get_or_init(bucket_index, tensor)
+    bstate.call_count += 1
+    call_n = bstate.call_count
+
+    do_full_log = (FULL_LOG_CALLS > 0 and call_n <= FULL_LOG_CALLS)
+    do_light_log = (not do_full_log and LIGHT_LOG_CALLS > 0
+                    and call_n <= LIGHT_LOG_CALLS)
+
+    if do_full_log or do_light_log:
+        pre = tensor.clone()
+
+    if do_full_log:
+        tid = threading.get_ident()
+        print(f"\n[RECURSIVE_DOUBLING | R{rank}|B{bstate.bucket_id}|C{call_n}] "
+              f"thread={tid} global_tag_before={_tag_counter} numel={numel}", flush=True)
+        print(f"  [R{rank}] INPUT tensor: {_fmt(tensor)}", flush=True)
+        print(f"  [R{rank}] flat.data_ptr={hex(bstate.flat.data_ptr())}", flush=True)
+        print(f"  [R{rank}] tmp.data_ptr={hex(bstate.tmp.data_ptr())}", flush=True)
+
+    _nvtx_range_push(f"bucket_grads_ready:B{bucket_index} rank={rank} call={call_n}")
+    _nvtx_range_pop()
+    def _work() -> None:
+        _recursive_doubling_allreduce_sum(
+            tensor,
+            bstate,
+            log=do_full_log,
+            call_n=call_n,
+        )
+
+    return _submit_async_hook_work(
+        f"{dist.get_backend()}:recursive_doubling",
+        tensor,
+        _work,
+    )
+
+# Hook aliases: plain recursive-doubling allreduce with no compression.
+nccl_recursive_doubling_allreduce_hook = _recursive_doubling_allreduce_hook
+mpi_recursive_doubling_allreduce_hook  = _recursive_doubling_allreduce_hook
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ZFP-COMPRESSED RING ALLREDUCE — naive point-to-point baseline
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class ZfpRingBucketState:
+    """Persistent buffers for ZFP ring variants, including online compression."""
+    flat:            Optional[torch.Tensor] = None
+    cnts:            List[int]              = field(default_factory=list)
+    displs:          List[int]              = field(default_factory=list)
+    send_comp:       List[torch.Tensor]     = field(default_factory=list)
+    recv_comp:       List[torch.Tensor]     = field(default_factory=list)
+    recv_decomp:     List[torch.Tensor]     = field(default_factory=list)
+    send_sizes:      List[torch.Tensor]     = field(default_factory=list)
+    recv_sizes:      List[torch.Tensor]     = field(default_factory=list)
+
+    # Online hook additions.
+    streams:         List[torch.cuda.Stream] = field(default_factory=list)
+    comp_bytes:      List[int]               = field(default_factory=list)
+    phase2_recv_comp: List[torch.Tensor]     = field(default_factory=list)
+    phase2_recv_bytes: List[int]             = field(default_factory=list)
+
+    bucket_id:       int                    = 0
+    call_count:      int                    = 0
+    ready:           bool                   = False
+    rate:            float                  = 16.0
+
+    def initialize(self, tensor: torch.Tensor, world_size: int, bucket_id: int, rate: float) -> None:
+        _require_zfp_cuda()
+        self.rate = rate
+        cfg = ZfpCompressionConfig(rate=rate)
+        numel = tensor.numel()
+        base_chunk = math.ceil(numel / world_size)
+
+        total = 0
+        self.cnts = []
+        for _ in range(world_size):
+            c = min(base_chunk, numel - total)
+            self.cnts.append(max(c, 0))
+            total += self.cnts[-1]
+
+        self.displs = [0]
+        for i in range(1, world_size):
+            self.displs.append(self.displs[-1] + self.cnts[i - 1])
+
+        self.flat = torch.empty(numel, dtype=tensor.dtype, device=tensor.device)
+        self.send_comp = []
+        self.recv_comp = []
+        self.recv_decomp = []
+        self.send_sizes = []
+        self.recv_sizes = []
+        self.streams = []
+        self.comp_bytes = []
+        self.phase2_recv_comp = []
+        self.phase2_recv_bytes = []
+
+        max_chunk_bytes = 0
+        for cnt in self.cnts:
+            recv_tensor = torch.empty(cnt, dtype=tensor.dtype, device=tensor.device)
+            self.recv_decomp.append(recv_tensor)
+
+            probe = torch.empty(cnt, dtype=tensor.dtype, device=tensor.device)
+            max_bytes = _zfp_max_output_bytes(probe, cfg.rate)
+            max_chunk_bytes = max(max_chunk_bytes, max_bytes)
+
+            self.send_comp.append(torch.empty(max_bytes, dtype=torch.uint8, device=tensor.device))
+            self.recv_comp.append(torch.empty(max_bytes, dtype=torch.uint8, device=tensor.device))
+            self.send_sizes.append(torch.zeros(1, dtype=torch.int64, device=tensor.device))
+            self.recv_sizes.append(torch.zeros(1, dtype=torch.int64, device=tensor.device))
+            self.comp_bytes.append(max_bytes)
+
+        self.streams = [
+            torch.cuda.Stream(device=tensor.device)
+            for _ in range(world_size)
+        ]
+
+        # Phase 2 forwards previously received compressed payloads directly.
+        # These per-step buffers prevent overwriting a buffer still used by an
+        # outstanding MPI_Isend.
+        self.phase2_recv_comp = [
+            torch.empty(max_chunk_bytes, dtype=torch.uint8, device=tensor.device)
+            for _ in range(max(world_size - 1, 1))
+        ]
+        self.phase2_recv_bytes = [0 for _ in range(max(world_size - 1, 1))]
+
+        self.bucket_id = bucket_id
+        self.ready = True
+
+@dataclass
+class ZfpRingAllreduceState:
+    rate: float = 16.0
+    buckets: Dict[int, ZfpRingBucketState] = field(default_factory=dict)
+
+    def get_or_init(self, bucket_index: int,
+                    tensor: torch.Tensor, world_size: int) -> ZfpRingBucketState:
+        bs = self.buckets.get(bucket_index)
+        if bs is None or bs.flat is None or bs.flat.numel() != tensor.numel():
+            bs = ZfpRingBucketState()
+            bs.initialize(tensor, world_size, bucket_index, self.rate)            
+            self.buckets[bucket_index] = bs
+        return bs
+
+
+def _ring_allreduce_zfp_sum(
+    tensor: torch.Tensor,
+    bstate: ZfpRingBucketState,
+    log: bool,
+    call_n: int = 0,
+) -> None:
+    """
+    Naive point-to-point ZFP baseline for ring allreduce.
+
+    This intentionally preserves the inefficiencies called out in the paper:
+      1. compress before every send,
+      2. decompress after every receive,
+      3. reduce on decompressed values,
+      4. recompress already-received data again during phase 2 allgather.
+
+    This is *not* the paper's later collective-level online compression scheme.
+    """
+    _require_zfp_cuda()
+    cfg = ZfpCompressionConfig(rate=bstate.rate)    
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    if world_size == 1:
+        return
+
+    pfx = f"[R{rank}|B{bstate.bucket_id}|C{call_n}]"
+    assert bstate.flat is not None
+    bstate.flat.copy_(tensor.flatten())
+    chunks = [
+        bstate.flat[bstate.displs[i]: bstate.displs[i] + bstate.cnts[i]]
+        for i in range(world_size)
+    ]
+
+    src = (rank - 1 + world_size) % world_size
+    dst = (rank + 1) % world_size
+
+    # Phase 1: standard ring reduce-scatter.
+    # Baseline behavior: each outgoing chunk is freshly compressed right before
+    # the send, and each incoming payload is decompressed before the local add.
+    _nvtx_range_push(f"zfp_ring_reduce_scatter:B{bstate.bucket_id} rank={rank}")
+    for step in range(world_size - 1):
+        send_idx = (rank - step - 1 + world_size) % world_size
+        recv_idx = (rank - step - 2 + world_size) % world_size
+
+        size_tag = _next_tag()
+        data_tag = _next_tag()
+
+        # Naive P2P compression on the sender side.
+        _nvtx_range_push(f"zfp_compress:B{bstate.bucket_id} phase=1 step={step}")
+        _cuda_sync(chunks[send_idx])
+        used_send = _zfp_compress_into(chunks[send_idx], bstate.send_comp[send_idx], cfg.rate)
+        bstate.send_sizes[send_idx].fill_(used_send)
+        _cuda_device_sync(bstate.send_comp[send_idx])
+        _nvtx_range_pop()
+
+        if log:
+            print(f"{pfx} ZFP P1 step={step} size_tag={size_tag} data_tag={data_tag} "
+                  f"send_idx={send_idx} recv_idx={recv_idx} send_bytes={used_send}",
+                  flush=True)
+
+        reqs = dist.batch_isend_irecv([
+            dist.P2POp(dist.irecv, bstate.recv_sizes[recv_idx], src, tag=size_tag),
+            dist.P2POp(dist.isend, bstate.send_sizes[send_idx], dst, tag=size_tag),
+        ])
+        for req in reqs:
+            req.wait()
+
+        recv_nbytes = int(bstate.recv_sizes[recv_idx].item())
+        reqs = dist.batch_isend_irecv([
+            dist.P2POp(dist.irecv, bstate.recv_comp[recv_idx][:recv_nbytes], src, tag=data_tag),
+            dist.P2POp(dist.isend, bstate.send_comp[send_idx][:used_send], dst, tag=data_tag),
+        ])
+        for req in reqs:
+            req.wait()
+
+        # Naive P2P decompression on the receiver side before reduction.
+        _nvtx_range_push(f"zfp_decompress:B{bstate.bucket_id} phase=1 step={step}")
+        _zfp_decompress_into(
+            bstate.recv_comp[recv_idx],
+            recv_nbytes,
+            bstate.recv_decomp[recv_idx],
+            cfg.rate,
+        )
+        _cuda_device_sync(bstate.recv_decomp[recv_idx])
+        _nvtx_range_pop()
+        chunks[recv_idx].add_(bstate.recv_decomp[recv_idx])
+
+    _nvtx_range_pop()
+
+    # Phase 2: standard ring allgather.
+    # The paper notes this baseline is inefficient because data that was already
+    # decompressed and aggregated is compressed again for forwarding.
+    _nvtx_range_push(f"zfp_ring_allgather:B{bstate.bucket_id} rank={rank}")
+    for step in range(world_size - 1):
+        send_idx = (rank - step + world_size) % world_size
+        recv_idx = (rank - step - 1 + world_size) % world_size
+
+        size_tag = _next_tag()
+        data_tag = _next_tag()
+
+        # Intentional baseline inefficiency: recompress before forwarding.
+        _nvtx_range_push(f"zfp_compress:B{bstate.bucket_id} phase=2 step={step}")
+        _cuda_sync(chunks[send_idx])
+        used_send = _zfp_compress_into(chunks[send_idx], bstate.send_comp[send_idx], cfg.rate)
+        bstate.send_sizes[send_idx].fill_(used_send)
+        _cuda_device_sync(bstate.send_comp[send_idx])
+        _nvtx_range_pop()
+
+        if log:
+            print(f"{pfx} ZFP P2 step={step} size_tag={size_tag} data_tag={data_tag} "
+                  f"send_idx={send_idx} recv_idx={recv_idx} send_bytes={used_send}",
+                  flush=True)
+
+        reqs = dist.batch_isend_irecv([
+            dist.P2POp(dist.irecv, bstate.recv_sizes[recv_idx], src, tag=size_tag),
+            dist.P2POp(dist.isend, bstate.send_sizes[send_idx], dst, tag=size_tag),
+        ])
+        for req in reqs:
+            req.wait()
+
+        recv_nbytes = int(bstate.recv_sizes[recv_idx].item())
+        reqs = dist.batch_isend_irecv([
+            dist.P2POp(dist.irecv, bstate.recv_comp[recv_idx][:recv_nbytes], src, tag=data_tag),
+            dist.P2POp(dist.isend, bstate.send_comp[send_idx][:used_send], dst, tag=data_tag),
+        ])
+        for req in reqs:
+            req.wait()
+
+        # Decompress received payload back into floating-point values.
+        _nvtx_range_push(f"zfp_decompress:B{bstate.bucket_id} phase=2 step={step}")
+        _zfp_decompress_into(
+            bstate.recv_comp[recv_idx],
+            recv_nbytes,
+            bstate.recv_decomp[recv_idx],
+            cfg.rate,
+        )
+        _cuda_device_sync(bstate.recv_decomp[recv_idx])
+        _nvtx_range_pop()
+        chunks[recv_idx].copy_(bstate.recv_decomp[recv_idx])
+
+    _nvtx_range_pop()
+
+    tensor.copy_(bstate.flat.view_as(tensor))
+    tensor.div_(world_size)
+    _cuda_sync(tensor)
+
+# Hook: naive point-to-point ZFP baseline layered on top of ring allreduce.
+def _ring_allreduce_zfp_hook(
+    state: ZfpRingAllreduceState,
+    bucket: dist.GradBucket,
+) -> torch.futures.Future[torch.Tensor]:
+    """DDP hook for the paper's naive ring + ZFP baseline."""
+    tensor = bucket.buffer()
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    numel = tensor.numel()
+    bucket_index = bucket.index()
+
+    bstate = state.get_or_init(bucket_index, tensor, world_size)
+    bstate.call_count += 1
+    call_n = bstate.call_count
+
+    do_full_log = (FULL_LOG_CALLS > 0 and call_n <= FULL_LOG_CALLS)
+
+    if do_full_log:
+        print(f"\n[RING_ZFP | R{rank}|B{bstate.bucket_id}|C{call_n}] numel={numel} "
+              f"global_tag_before={_tag_counter}", flush=True)
+
+    def _work() -> None:
+        _ring_allreduce_zfp_sum(
+            tensor,
+            bstate,
+            log=do_full_log,
+            call_n=call_n,
+        )
+
+    return _submit_async_hook_work(
+        f"{dist.get_backend()}:ring_zfp_naive:rate{bstate.rate:g}",
+        tensor,
+        _work,
+    )
+
+
+# Hook aliases: naive point-to-point ZFP baseline layered on top of ring.
+nccl_ring_zfp_allreduce_hook = _ring_allreduce_zfp_hook
+mpi_ring_zfp_allreduce_hook  = _ring_allreduce_zfp_hook
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ZFP-COMPRESSED RECURSIVE DOUBLING — naive point-to-point baseline
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class ZfpRecursiveDoublingBucketState:
+    """Persistent buffers for the paper's naive P2P ZFP baseline on recursive doubling."""
+    flat:       Optional[torch.Tensor] = None
+    tmp:        Optional[torch.Tensor] = None
+    send_comp:  Optional[torch.Tensor] = None
+    recv_comp:  Optional[torch.Tensor] = None
+    send_size:  Optional[torch.Tensor] = None
+    recv_size:  Optional[torch.Tensor] = None
+    bucket_id:  int                    = 0
+    call_count: int                    = 0
+    rate:       float                  = 16.0
+
+    def initialize(self, tensor: torch.Tensor, bucket_id: int, rate: float) -> None:
+        _require_zfp_cuda()
+        self.rate = rate
+        cfg = ZfpCompressionConfig(rate=rate)
+        self.flat = torch.empty(tensor.numel(), dtype=tensor.dtype, device=tensor.device)
+        self.tmp = torch.empty_like(self.flat)
+        max_bytes = _zfp_max_output_bytes(self.flat, cfg.rate)
+        self.send_comp = torch.empty(max_bytes, dtype=torch.uint8, device=tensor.device)
+        self.recv_comp = torch.empty(max_bytes, dtype=torch.uint8, device=tensor.device)
+        self.send_size = torch.zeros(1, dtype=torch.int64, device=tensor.device)
+        self.recv_size = torch.zeros(1, dtype=torch.int64, device=tensor.device)
+        self.bucket_id = bucket_id
+
+
+@dataclass
+class ZfpRecursiveDoublingAllreduceState:
+    rate: float = 16.0
+    buckets: Dict[int, ZfpRecursiveDoublingBucketState] = field(default_factory=dict)
+
+    def get_or_init(self, bucket_index: int,
+                    tensor: torch.Tensor) -> ZfpRecursiveDoublingBucketState:
+        bs = self.buckets.get(bucket_index)
+        if bs is None or bs.flat is None or bs.flat.numel() != tensor.numel():
+            bs = ZfpRecursiveDoublingBucketState()
+            bs.initialize(tensor, bucket_index, self.rate)
+            self.buckets[bucket_index] = bs
+        return bs
+
+
+def _zfp_sendrecv_tensor(
+    work: torch.Tensor,
+    send_comp: torch.Tensor,
+    recv_comp: torch.Tensor,
+    send_size: torch.Tensor,
+    recv_size: torch.Tensor,
+    recv_out: torch.Tensor,
+    peer: int,
+    size_tag: int,
+    data_tag: int,
+    rate: float,
+) -> None:
+    """One naive compressed pairwise exchange: compress, exchange, decompress."""
+    used_send = _zfp_compress_into(work, send_comp, rate)
+    send_size.fill_(used_send)
+    _cuda_device_sync(send_comp)
+
+    reqs = dist.batch_isend_irecv([
+        dist.P2POp(dist.irecv, recv_size, peer, tag=size_tag),
+        dist.P2POp(dist.isend, send_size, peer, tag=size_tag),
+    ])
+    for req in reqs:
+        req.wait()
+
+    recv_nbytes = int(recv_size.item())
+    reqs = dist.batch_isend_irecv([
+        dist.P2POp(dist.irecv, recv_comp[:recv_nbytes], peer, tag=data_tag),
+        dist.P2POp(dist.isend, send_comp[:used_send], peer, tag=data_tag),
+    ])
+    for req in reqs:
+        req.wait()
+
+    _zfp_decompress_into(recv_comp, recv_nbytes, recv_out, rate)
+    _cuda_device_sync(recv_out)
+
+
+def _recursive_doubling_zfp_sum(
+    tensor: torch.Tensor,
+    bstate: ZfpRecursiveDoublingBucketState,
+    log: bool,
+    call_n: int = 0,
+) -> None:
+    """
+    Naive point-to-point ZFP baseline for recursive doubling.
+
+    Each recursive-doubling exchange remains structurally identical to the
+    original collective, but every send is preceded by ZFP compression and every
+    receive is followed by ZFP decompression before local reduction.
+
+    This intentionally introduces the extra compression/decompression and sync
+    overheads described in the paper's baseline discussion.
+    """
+    _require_zfp_cuda()
+    cfg = ZfpCompressionConfig(rate=bstate.rate)    
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    if world_size == 1:
+        return
+
+    pfx = f"[R{rank}|B{bstate.bucket_id}|C{call_n}]"
+    assert bstate.flat is not None
+    assert bstate.tmp is not None
+    assert bstate.send_comp is not None
+    assert bstate.recv_comp is not None
+    assert bstate.send_size is not None
+    assert bstate.recv_size is not None
+
+    work = bstate.flat
+    tmp = bstate.tmp
+    work.copy_(tensor.flatten())
+
+    pof2 = 1
+    while pof2 <= world_size:
+        pof2 <<= 1
+    pof2 >>= 1
+    rem = world_size - pof2
+    newrank = -1
+
+    # Phase 0: non-power-of-two peel.
+    # Baseline behavior: the peeled exchange itself is also wrapped in
+    # compress/send and recv/decompress.
+    peel_size_tag = _next_tag()
+    peel_data_tag = _next_tag()
+    _nvtx_range_push(f"zfp_recursive_doubling_peel:B{bstate.bucket_id} rank={rank}")
+    if rank < 2 * rem:
+        partner = rank + 1 if rank % 2 == 0 else rank - 1
+        if rank % 2 == 0:
+            # Even peeled rank: compress and send its full working buffer.
+            used_send = _zfp_compress_into(work, bstate.send_comp, cfg.rate)
+            bstate.send_size.fill_(used_send)
+            _cuda_device_sync(bstate.send_comp)
+            reqs = dist.batch_isend_irecv([
+                dist.P2POp(dist.isend, bstate.send_size, partner, tag=peel_size_tag),
+            ])
+            for req in reqs:
+                req.wait()
+            reqs = dist.batch_isend_irecv([
+                dist.P2POp(dist.isend, bstate.send_comp[:used_send], partner, tag=peel_data_tag),
+            ])
+            for req in reqs:
+                req.wait()
+            newrank = -1
+        else:
+            # Odd peeled rank: receive compressed payload, decompress, reduce.
+            reqs = dist.batch_isend_irecv([
+                dist.P2POp(dist.irecv, bstate.recv_size, partner, tag=peel_size_tag),
+            ])
+            for req in reqs:
+                req.wait()
+            recv_nbytes = int(bstate.recv_size.item())
+            reqs = dist.batch_isend_irecv([
+                dist.P2POp(dist.irecv, bstate.recv_comp[:recv_nbytes], partner, tag=peel_data_tag),
+            ])
+            for req in reqs:
+                req.wait()
+            _zfp_decompress_into(bstate.recv_comp, recv_nbytes, tmp, cfg.rate)
+            _cuda_device_sync(tmp)
+            work.add_(tmp)
+            newrank = rank // 2
+            if log:
+                print(f"{pfx} peel recv_bytes={recv_nbytes} from rank{partner}", flush=True)
+    else:
+        newrank = rank - rem
+    _nvtx_range_pop()
+
+    # Phase 1: standard recursive-doubling exchanges across the surviving pof2 ranks.
+    # Baseline behavior: every pairwise exchange performs a fresh compression
+    # before the send and a decompression before the local add.
+    _nvtx_range_push(f"zfp_recursive_doubling_main:B{bstate.bucket_id} rank={rank}")
+    mask = 1
+    while mask < pof2:
+        size_tag = _next_tag()
+        data_tag = _next_tag()
+        if newrank != -1:
+            newdst = newrank ^ mask
+            dst = (newdst << 1) + 1 if newdst < rem else newdst + rem
+            _zfp_sendrecv_tensor(
+                work,
+                bstate.send_comp,
+                bstate.recv_comp,
+                bstate.send_size,
+                bstate.recv_size,
+                tmp,
+                dst,
+                size_tag,
+                data_tag,
+                cfg.rate,
+            )
+            work.add_(tmp)
+            if log:
+                print(f"{pfx} main mask={mask} peer={dst} recv_bytes={int(bstate.recv_size.item())}",
+                      flush=True)
+        mask <<= 1
+    _nvtx_range_pop()
+
+    # Phase 2: send the final reduced result back to the peeled ranks.
+    # This also uses the same naive compress/send and recv/decompress pattern.
+    final_size_tag = _next_tag()
+    final_data_tag = _next_tag()
+    _nvtx_range_push(f"zfp_recursive_doubling_finalize:B{bstate.bucket_id} rank={rank}")
+    if rank < 2 * rem:
+        partner = rank - 1 if rank % 2 else rank + 1
+        if rank % 2:
+            used_send = _zfp_compress_into(work, bstate.send_comp, cfg.rate)
+            bstate.send_size.fill_(used_send)
+            _cuda_device_sync(bstate.send_comp)
+            reqs = dist.batch_isend_irecv([
+                dist.P2POp(dist.isend, bstate.send_size, partner, tag=final_size_tag),
+            ])
+            for req in reqs:
+                req.wait()
+            reqs = dist.batch_isend_irecv([
+                dist.P2POp(dist.isend, bstate.send_comp[:used_send], partner, tag=final_data_tag),
+            ])
+            for req in reqs:
+                req.wait()
+        else:
+            reqs = dist.batch_isend_irecv([
+                dist.P2POp(dist.irecv, bstate.recv_size, partner, tag=final_size_tag),
+            ])
+            for req in reqs:
+                req.wait()
+            recv_nbytes = int(bstate.recv_size.item())
+            reqs = dist.batch_isend_irecv([
+                dist.P2POp(dist.irecv, bstate.recv_comp[:recv_nbytes], partner, tag=final_data_tag),
+            ])
+            for req in reqs:
+                req.wait()
+            _zfp_decompress_into(bstate.recv_comp, recv_nbytes, work, cfg.rate)
+            _cuda_device_sync(work)
+            if log:
+                print(f"{pfx} final recv_bytes={recv_nbytes} from rank{partner}", flush=True)
+    _nvtx_range_pop()
+
+    tensor.copy_(work.view_as(tensor))
+    tensor.div_(world_size)
+    _cuda_sync(tensor)
+
+# Hook: naive point-to-point ZFP baseline layered on top of recursive doubling.
+def _recursive_doubling_zfp_hook(
+    state: ZfpRecursiveDoublingAllreduceState,
+    bucket: dist.GradBucket,
+) -> torch.futures.Future[torch.Tensor]:
+    """DDP hook for the paper's naive recursive-doubling + ZFP baseline."""
+    tensor = bucket.buffer()
+    rank = dist.get_rank()
+    numel = tensor.numel()
+    bucket_index = bucket.index()
+
+    bstate = state.get_or_init(bucket_index, tensor)
+    bstate.call_count += 1
+    call_n = bstate.call_count
+    do_full_log = (FULL_LOG_CALLS > 0 and call_n <= FULL_LOG_CALLS)
+
+    if do_full_log:
+        print(f"\n[RECURSIVE_DOUBLING_ZFP | R{rank}|B{bstate.bucket_id}|C{call_n}] "
+              f"numel={numel} global_tag_before={_tag_counter}", flush=True)
+
+    def _work() -> None:
+        _recursive_doubling_zfp_sum(
+            tensor,
+            bstate,
+            log=do_full_log,
+            call_n=call_n,
+        )
+
+    return _submit_async_hook_work(
+        f"{dist.get_backend()}:recursive_doubling_zfp_naive:rate{bstate.rate:g}",
+        tensor,
+        _work,
+    )
+
+
+def _ring_allreduce_zfp_online_coll_sum(
+    tensor: torch.Tensor,
+    bstate: ZfpRingBucketState,
+    log: bool,
+    call_n: int = 0,
+) -> None:
+    """
+    Algorithm 1: Collective-level Online Compression Design for Ring MPI Allreduce.
+
+    This implementation follows the paper's chunk-index formulas exactly.
+
+    Phase 1:
+      line 2: si = (rank - i + N) % N
+      line 3: ri = (rank - i - 1 + N) % N
+
+    Phase 2:
+      line 21: si = (rank - i + 1 + N) % N
+      line 22: ri = (rank - i + N) % N
+
+    B is deterministic because the wrapper uses fixed-rate ZFP. Therefore B is
+    precomputed per chunk in bstate.comp_bytes and no extra size exchange is
+    needed for this online algorithm.
+    """
+    _require_zfp_cuda()
+    cfg = ZfpCompressionConfig(rate=bstate.rate)
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    if world_size == 1:
+        return
+
+    assert bstate.flat is not None
+    assert bstate.streams
+    assert bstate.comp_bytes
+
+    left = (rank - 1 + world_size) % world_size
+    right = (rank + 1) % world_size
+
+    # Paper input S -> local DDP bucket tensor.
+    # Paper output R -> bstate.flat.
+    #
+    # Figure 3: copy sendbuf to recvbuf using device-to-device cudaMemcpy.
+    bstate.flat.copy_(tensor.flatten())
+
+    chunks = [
+        bstate.flat[bstate.displs[i]: bstate.displs[i] + bstate.cnts[i]]
+        for i in range(world_size)
+    ]
+
+    # The copy into R was enqueued on the current PyTorch stream. All non-default
+    # ZFP streams must wait for it before reading chunks.
+    current_stream = torch.cuda.current_stream(device=tensor.device)
+    for s in bstate.streams:
+        s.wait_stream(current_stream)
+
+    send_reqs = []
+
+    # =========================================================================
+    # Lines 1-19: Phase 1, reduce-scatter with collective-level online compression
+    # =========================================================================
+    for i in range(world_size - 1):
+        # Lines 2-3.
+        si = (rank - i + world_size) % world_size
+        ri = (rank - i - 1 + world_size) % world_size
+
+        tag = _next_tag()
+        send_B = bstate.comp_bytes[si]
+        recv_B = bstate.comp_bytes[ri]
+
+        # Lines 4-5.
+        # First iteration compresses the initially available R_si.
+        if i == 0:
+            with torch.cuda.stream(bstate.streams[si]):
+                used_bits = _zfp_compress_into_current_stream(
+                    chunks[si],
+                    bstate.send_comp[si],
+                    cfg.rate,
+                )
+                used_bytes = _zfp_pad_tail_to_B_(bstate.send_comp[si], used_bits, send_B)
+
+            if log:
+                print(f"[R{rank}|B{bstate.bucket_id}|C{call_n}] "
+                    f"P1 line5 i={i} si={si} used_bits={int(used_bits)} used_bytes={used_bytes} B={send_B}",
+                    flush=True)
+
+
+        # Line 6.
+        # Post receive before waiting for compression, giving compression and
+        # MPI_Irecv the opportunity to overlap.
+        recv_req = dist.irecv(
+            bstate.recv_comp[ri][:recv_B],
+            src=left,
+            tag=tag,
+        )
+
+        if i == 0:
+            # Lines 7-8.
+            # Wait only for the stream that produced R_tmp_si.
+            bstate.streams[si].synchronize()
+        else:
+            # Lines 9-12.
+            #
+            # In the paper formula, current si equals the ri from the previous
+            # iteration. That chunk was produced by the previous
+            # decompress+reduction stream, so wait for it, then compress it.
+            bstate.streams[si].synchronize()
+
+            # Line 11.
+            with torch.cuda.stream(bstate.streams[si]):
+                used_bits = _zfp_compress_into_current_stream(
+                    chunks[si],
+                    bstate.send_comp[si],
+                    cfg.rate,
+                )
+                used_bytes = _zfp_pad_tail_to_B_(bstate.send_comp[si], used_bits, send_B)
+
+            if log:
+                print(f"[R{rank}|B{bstate.bucket_id}|C{call_n}] "
+                    f"P1 line11 i={i} si={si} used_bits={int(used_bits)} used_bytes={used_bytes} B={send_B}",
+                    flush=True)
+
+
+            # Line 12.
+            bstate.streams[si].synchronize()
+
+        # Line 13.
+        send_req = dist.isend(
+            bstate.send_comp[si][:send_B],
+            dst=right,
+            tag=tag,
+        )
+        send_reqs.append(send_req)
+
+        # Line 14.
+        recv_req.wait()
+
+        # Lines 15-16.
+        # Decompression and reduction are launched on the same stream. CUDA
+        # stream ordering makes the reduction wait for decompression without a
+        # host-side synchronization.
+        with torch.cuda.stream(bstate.streams[ri]):
+            _zfp_decompress_into_current_stream(
+                bstate.recv_comp[ri],
+                recv_B,
+                bstate.recv_decomp[ri],
+                cfg.rate,
+            )
+            chunks[ri].add_(bstate.recv_decomp[ri])
+
+        if log:
+            print(f"[R{rank}|B{bstate.bucket_id}|C{call_n}] "
+                  f"P1 i={i} si={si} ri={ri} tag={tag} Bsend={send_B} Brecv={recv_B}",
+                  flush=True)
+
+    # Lines 17-18.
+    # Wait for the last reduction stream. Under the paper's formula, this is
+    # the chunk index (rank + 1) % N.
+    ri = (rank + 1) % world_size
+    bstate.streams[ri].synchronize()
+
+    # Line 19.
+    for req in send_reqs:
+        req.wait()
+
+    send_reqs = []
+
+    # =========================================================================
+    # Lines 20-33: Phase 2, allgather with compressed forwarding
+    # =========================================================================
+    for i in range(world_size - 1):
+        # Lines 21-22.
+        si = (rank - i + 1 + world_size) % world_size
+        ri = (rank - i + world_size) % world_size
+
+        tag = _next_tag()
+        send_B = bstate.comp_bytes[si]
+        recv_B = bstate.comp_bytes[ri]
+
+        # Lines 23-24.
+        # Only the first phase-2 send compresses the local fully reduced chunk.
+        # Later sends forward a previously received compressed payload directly.
+        if i == 0:
+            with torch.cuda.stream(bstate.streams[si]):
+                used_bits = _zfp_compress_into_current_stream(
+                    chunks[si],
+                    bstate.send_comp[si],
+                    cfg.rate,
+                )
+                used_bytes = _zfp_pad_tail_to_B_(bstate.send_comp[si], used_bits, send_B)
+
+            if log:
+                print(f"[R{rank}|B{bstate.bucket_id}|C{call_n}] "
+                    f"P2 line24 i={i} si={si} used_bits={int(used_bits)} used_bytes={used_bytes} B={send_B}",
+                    flush=True)
+
+
+        # Line 25.
+        # Receive into a per-step compressed buffer so it can be forwarded later
+        # without being overwritten by another receive.
+        recv_buf = bstate.phase2_recv_comp[i][:recv_B]
+        recv_req = dist.irecv(
+            recv_buf,
+            src=left,
+            tag=tag,
+        )
+        bstate.phase2_recv_bytes[i] = recv_B
+
+        if i == 0:
+            # Lines 26-27.
+            bstate.streams[si].synchronize()
+            send_buf = bstate.send_comp[si]
+        else:
+            # Line 28, paper text:
+            # MPI_Isend directly sends out the previously received compressed
+            # chunk.  Previous step's receive buffer is i-1.
+            send_buf = bstate.phase2_recv_comp[i - 1]
+
+        # Line 28.
+        send_req = dist.isend(
+            send_buf[:send_B],
+            dst=right,
+            tag=tag,
+        )
+        send_reqs.append(send_req)
+        
+        # FIX 2 (replica consistency): the owner keeps exactly what every other
+        # rank will decode, so all replicas hold bit-identical gradients.
+        # Launched after the send is posted -> overlaps with communication.
+        if i == 0:
+            with torch.cuda.stream(bstate.streams[si]):
+                _zfp_decompress_into_current_stream(
+                    bstate.send_comp[si], send_B, chunks[si], cfg.rate,
+                )
+
+        # Line 29.
+        recv_req.wait()
+
+        # Line 30.
+        # No reduction in allgather. Decompress received compressed data into R_ri.
+        with torch.cuda.stream(bstate.streams[ri]):
+            _zfp_decompress_into_current_stream(
+                bstate.phase2_recv_comp[i],
+                recv_B,
+                chunks[ri],
+                cfg.rate,
+            )
+
+        if log:
+            print(f"[R{rank}|B{bstate.bucket_id}|C{call_n}] "
+                  f"P2 i={i} si={si} ri={ri} tag={tag} Bsend={send_B} Brecv={recv_B}",
+                  flush=True)
+
+    # Lines 31-32.
+    for i in range(world_size - 1):
+        ri = (rank - i + world_size) % world_size
+        bstate.streams[ri].synchronize()
+
+    # Line 33.
+    for req in send_reqs:
+        req.wait()
+
+    # Final DDP result. Synchronize all non-default streams before copying the
+    # completed R buffer back to DDP's bucket tensor.
+    for s in bstate.streams:
+        s.synchronize()
+
+    tensor.copy_(bstate.flat.view_as(tensor))
+    tensor.div_(world_size)
+    _cuda_sync(tensor)
+    
+def _ring_allreduce_zfp_online_coll_hook(
+    state: ZfpRingAllreduceState,
+    bucket: dist.GradBucket,
+) -> torch.futures.Future[torch.Tensor]:
+    """DDP hook for Algorithm 1: ring collective-level online ZFP compression."""
+    tensor = bucket.buffer()
+    rank = dist.get_rank()
+    bucket_index = bucket.index()
+    world_size = dist.get_world_size()
+    numel = tensor.numel()
+
+    bstate = state.get_or_init(bucket_index, tensor, world_size)
+    bstate.call_count += 1
+    call_n = bstate.call_count
+
+    do_full_log = (FULL_LOG_CALLS > 0 and call_n <= FULL_LOG_CALLS)
+
+    if do_full_log:
+        print(f"\n[RING_ZFP_ONLINE_COLL | R{rank}|B{bstate.bucket_id}|C{call_n}] "
+              f"numel={numel} global_tag_before={_tag_counter}",
+              flush=True)
+
+    def _work() -> None:
+        _ring_allreduce_zfp_online_coll_sum(
+            tensor,
+            bstate,
+            log=do_full_log,
+            call_n=call_n,
+        )
+
+    return _submit_async_hook_work(
+        f"{dist.get_backend()}:ring_zfp_online_coll:rate{bstate.rate:g}",
+        tensor,
+        _work,
+    )
+
+
+@dataclass
+class ZfpRecursiveDoublingOnlineBucketState:
+    """Persistent buffers for recursive-doubling collective-level online ZFP."""
+    flat: Optional[torch.Tensor] = None
+    recv_decomp: List[torch.Tensor] = field(default_factory=list)
+    send_comp: List[torch.Tensor] = field(default_factory=list)
+    recv_comp: List[torch.Tensor] = field(default_factory=list)
+    streams: List[torch.cuda.Stream] = field(default_factory=list)
+    comp_bytes: int = 0
+    bucket_id: int = 0
+    call_count: int = 0
+    rate: float = 16.0
+
+    def initialize(self, tensor: torch.Tensor, world_size: int, bucket_id: int, rate: float) -> None:
+        _require_zfp_cuda()
+        self.rate = rate
+        cfg = ZfpCompressionConfig(rate=rate)
+        numel = tensor.numel()
+        self.flat = torch.empty(numel, dtype=tensor.dtype, device=tensor.device)
+
+        pof2 = 1
+        while pof2 * 2 <= world_size:
+            pof2 *= 2
+
+        num_steps = int(math.log2(pof2)) if pof2 > 1 else 0
+        # +2 gives room for peel/finalize plus recursive-doubling steps.
+        num_slots = max(num_steps + 2, 1)
+
+        self.comp_bytes = int(_zfp_max_output_bytes(self.flat, cfg.rate))
+
+        self.recv_decomp = [
+            torch.empty_like(self.flat)
+            for _ in range(num_slots)
+        ]
+        self.send_comp = [
+            torch.empty(self.comp_bytes, dtype=torch.uint8, device=tensor.device)
+            for _ in range(num_slots)
+        ]
+        self.recv_comp = [
+            torch.empty(self.comp_bytes, dtype=torch.uint8, device=tensor.device)
+            for _ in range(num_slots)
+        ]
+        self.streams = [
+            torch.cuda.Stream(device=tensor.device)
+            for _ in range(world_size)
+        ]
+
+        self.bucket_id = bucket_id
+
+
+@dataclass
+class ZfpRecursiveDoublingOnlineAllreduceState:
+    rate: float = 16.0
+    buckets: Dict[int, ZfpRecursiveDoublingOnlineBucketState] = field(default_factory=dict)
+
+    def get_or_init(
+        self,
+        bucket_index: int,
+        tensor: torch.Tensor,
+        world_size: int,
+    ) -> ZfpRecursiveDoublingOnlineBucketState:
+        bs = self.buckets.get(bucket_index)
+        if bs is None or bs.flat is None or bs.flat.numel() != tensor.numel():
+            bs = ZfpRecursiveDoublingOnlineBucketState()
+            bs.initialize(tensor, world_size, bucket_index, self.rate)
+            self.buckets[bucket_index] = bs
+        return bs
+    
+def _recursive_doubling_zfp_online_coll_sum(
+    tensor: torch.Tensor,
+    bstate: ZfpRecursiveDoublingOnlineBucketState,
+    log: bool,
+    call_n: int = 0,
+) -> None:
+    """
+    Algorithm 2: Collective-level Online Compression for Recursive-Doubling MPI Allreduce.
+
+    This is the MPI-style version. It uses separate dist.irecv/dist.isend calls
+    so the receive can be posted while ZFP compression runs on a non-default
+    CUDA stream.
+
+    The reduction kernel is launched on the same stream as decompression.
+    Sends are waited after the recursive-doubling loop, matching line 39.
+    """
+    _require_zfp_cuda()
+    cfg = ZfpCompressionConfig(rate=bstate.rate)
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    if world_size == 1:
+        return
+
+    assert bstate.flat is not None
+    assert bstate.streams
+    assert bstate.send_comp
+    assert bstate.recv_comp
+    assert bstate.recv_decomp
+
+    work = bstate.flat
+    work.copy_(tensor.flatten())
+
+    current_stream = torch.cuda.current_stream(device=tensor.device)
+    for s in bstate.streams:
+        s.wait_stream(current_stream)
+
+    B = bstate.comp_bytes
+    send_reqs = []
+
+    # Lines 1-2.
+    pof2 = 1
+    while pof2 * 2 <= world_size:
+        pof2 *= 2
+    rem = world_size - pof2
+
+    # Line 3.
+    newrank = 0
+
+    # =========================================================================
+    # Lines 4-13: non-power-of-two peel.
+    # =========================================================================
+    peel_tag = _next_tag()
+
+    if rank < 2 * rem:
+        if rank % 2 == 0:
+            # Lines 5-7:
+            # Even rank compresses and sends to rank + 1, then drops out.
+            dst = rank + 1
+            stream = bstate.streams[dst]
+
+            with torch.cuda.stream(stream):
+                used_bits = _zfp_compress_into_current_stream(
+                    work,
+                    bstate.send_comp[0],
+                    cfg.rate,
+                )
+                used_bytes = _zfp_pad_tail_to_B_(bstate.send_comp[0], used_bits, B)
+
+            if log and used_bytes != B:
+                print(f"[R{rank}|B{bstate.bucket_id}|C{call_n}] "
+                      f"peel send used={used_bytes} expected={B}",
+                      flush=True)
+
+            stream.synchronize()
+            send_req = dist.isend(
+                bstate.send_comp[0][:B],
+                dst=dst,
+                tag=peel_tag,
+            )
+            send_reqs.append(send_req)
+            newrank = -1
+
+        else:
+            # Lines 8-11:
+            # Odd rank receives compressed data from rank - 1, decompresses,
+            # reduces with its own data, and enters the pof2 communicator.
+            src = rank - 1
+            stream = bstate.streams[src]
+
+            recv_req = dist.irecv(
+                bstate.recv_comp[0][:B],
+                src=src,
+                tag=peel_tag,
+            )
+            recv_req.wait()
+
+            with torch.cuda.stream(stream):
+                _zfp_decompress_into_current_stream(
+                    bstate.recv_comp[0],
+                    B,
+                    bstate.recv_decomp[0],
+                    cfg.rate,
+                )
+                work.add_(bstate.recv_decomp[0])
+
+            stream.synchronize()
+            newrank = rank // 2
+    else:
+        # Lines 12-13.
+        newrank = rank - rem
+
+    # =========================================================================
+    # Lines 14-39: recursive-doubling over the pof2 active ranks.
+    # =========================================================================
+    last_reduce_stream = None
+
+    if newrank != -1:
+        # Line 15.
+        mask = 0x1
+        step = 0
+
+        # Line 16.
+        while mask < pof2:
+            # Lines 17-18.
+            newdst = newrank ^ mask
+            dst = (newdst * 2 + 1) if newdst < rem else (newdst + rem)
+
+            tag = _next_tag()
+            slot = step + 1
+
+            # Lines 21-23:
+            # Choose the stream for the following reduction. If there is a next
+            # recursive-doubling step, reduce on that next step's stream so the
+            # next compression is naturally ordered after reduction. On the last
+            # step, use the current peer's stream.
+            mask2 = mask << 1
+            if mask2 < pof2:
+                newdst2 = newrank ^ mask2
+                dst2 = (newdst2 * 2 + 1) if newdst2 < rem else (newdst2 + rem)
+            else:
+                dst2 = dst
+
+            send_stream = bstate.streams[dst]
+            reduce_stream = bstate.streams[dst2]
+            last_reduce_stream = reduce_stream
+
+            if mask == 0x1:
+                # Lines 19-20:
+                # First active step compresses the current buffer S/R.
+                with torch.cuda.stream(send_stream):
+                    used_bits = _zfp_compress_into_current_stream(
+                        work,
+                        bstate.send_comp[slot],
+                        cfg.rate,
+                    )
+                    used_bytes = _zfp_pad_tail_to_B_(bstate.send_comp[slot], used_bits, B)
+
+                # Line 24:
+                # Post receive while compression is in flight.
+                recv_req = dist.irecv(
+                    bstate.recv_comp[slot][:B],
+                    src=dst,
+                    tag=tag,
+                )
+
+                # Lines 29-30.
+                send_stream.synchronize()
+
+            else:
+                # Line 24:
+                # Post receive first so receive can overlap with compression.
+                recv_req = dist.irecv(
+                    bstate.recv_comp[slot][:B],
+                    src=dst,
+                    tag=tag,
+                )
+
+                # Lines 25-28:
+                # Wait for the stream that produced the current R, then compress.
+                send_stream.synchronize()
+                with torch.cuda.stream(send_stream):
+                    used_bits = _zfp_compress_into_current_stream(
+                        work,
+                        bstate.send_comp[slot],
+                        cfg.rate,
+                    )
+                    used_bytes = _zfp_pad_tail_to_B_(bstate.send_comp[slot], used_bits, B)
+                send_stream.synchronize()
+
+            if log and used_bytes != B:
+                print(f"[R{rank}|B{bstate.bucket_id}|C{call_n}] "
+                      f"main step={step} mask={mask} dst={dst} used={used_bytes} expected={B}",
+                      flush=True)
+
+            # Line 31.
+            send_req = dist.isend(
+                bstate.send_comp[slot][:B],
+                dst=dst,
+                tag=tag,
+            )
+            send_reqs.append(send_req)
+            
+            # FIX 2 (replica consistency): replace our own contribution by its
+            # lossy version, so both partners compute D(C(a)) + D(C(b)) and end
+            # up bit-identical. Overlaps with the network wait below.
+            with torch.cuda.stream(reduce_stream):
+                _zfp_decompress_into_current_stream(
+                    bstate.send_comp[slot], B, work, cfg.rate,
+                )
+
+            # Line 32.
+            recv_req.wait()
+
+            # Lines 33-34:
+            # Decompress and reduce on the same stream.
+            with torch.cuda.stream(reduce_stream):
+                _zfp_decompress_into_current_stream(
+                    bstate.recv_comp[slot],
+                    B,
+                    bstate.recv_decomp[slot],
+                    cfg.rate,
+                )
+                work.add_(bstate.recv_decomp[slot])
+
+            if log:
+                print(f"[R{rank}|B{bstate.bucket_id}|C{call_n}] "
+                      f"main step={step} mask={mask} dst={dst} dst2={dst2} tag={tag}",
+                      flush=True)
+
+            # Line 35.
+            mask <<= 1
+            step += 1
+
+        # Lines 36-38:
+        # Wait for the last reduction kernel.
+        if last_reduce_stream is not None:
+            last_reduce_stream.synchronize()
+
+        # Line 39.
+        for req in send_reqs:
+            req.wait()
+        send_reqs = []
+
+    else:
+        # Inactive peeled even ranks still consume the same main-loop tags so
+        # future hook invocations remain tag-aligned across all ranks.
+        mask = 0x1
+        while mask < pof2:
+            _next_tag()
+            mask <<= 1
+
+        for req in send_reqs:
+            req.wait()
+        send_reqs = []
+
+    # =========================================================================
+    # Lines 40-45: non-power-of-two finalize.
+    # =========================================================================
+    final_tag = _next_tag()
+
+    if rank < 2 * rem:
+        if rank % 2 == 0:
+            # Lines 40-43:
+            # Even peeled rank receives the final compressed result from rank+1.
+            src = rank + 1
+            stream = bstate.streams[src]
+
+            recv_req = dist.irecv(
+                bstate.recv_comp[0][:B],
+                src=src,
+                tag=final_tag,
+            )
+            recv_req.wait()
+
+            with torch.cuda.stream(stream):
+                _zfp_decompress_into_current_stream(
+                    bstate.recv_comp[0],
+                    B,
+                    work,
+                    cfg.rate,
+                )
+
+            stream.synchronize()
+
+        else:
+            # Lines 44-45:
+            # Odd active rank sends compressed final result back to rank-1.
+            dst = rank - 1
+            stream = bstate.streams[dst]
+
+            stream.synchronize()
+            with torch.cuda.stream(stream):
+                used_bits = _zfp_compress_into_current_stream(
+                    work,
+                    bstate.send_comp[0],
+                    cfg.rate,
+                )
+                used_bytes = _zfp_pad_tail_to_B_(bstate.send_comp[0], used_bits, B)
+
+            if log and used_bytes != B:
+                print(f"[R{rank}|B{bstate.bucket_id}|C{call_n}] "
+                      f"final send used={used_bytes} expected={B}",
+                      flush=True)
+
+            stream.synchronize()
+            send_req = dist.isend(
+                bstate.send_comp[0][:B],
+                dst=dst,
+                tag=final_tag,
+            )
+            send_req.wait()
+
+    for s in bstate.streams:
+        s.synchronize()
+
+    tensor.copy_(work.view_as(tensor))
+    tensor.div_(world_size)
+    _cuda_sync(tensor)
+    
+def _recursive_doubling_zfp_online_coll_hook(
+    state: ZfpRecursiveDoublingOnlineAllreduceState,
+    bucket: dist.GradBucket,
+) -> torch.futures.Future[torch.Tensor]:
+    """DDP hook for Algorithm 2: recursive-doubling collective-level online ZFP."""
+    tensor = bucket.buffer()
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    bucket_index = bucket.index()
+    numel = tensor.numel()
+
+    bstate = state.get_or_init(bucket_index, tensor, world_size)
+    bstate.call_count += 1
+    call_n = bstate.call_count
+
+    do_full_log = (FULL_LOG_CALLS > 0 and call_n <= FULL_LOG_CALLS)
+
+    if do_full_log:
+        print(f"\n[RECURSIVE_DOUBLING_ZFP_ONLINE_COLL | R{rank}|B{bstate.bucket_id}|C{call_n}] "
+              f"numel={numel} global_tag_before={_tag_counter}",
+              flush=True)
+
+    def _work() -> None:
+        _recursive_doubling_zfp_online_coll_sum(
+            tensor,
+            bstate,
+            log=do_full_log,
+            call_n=call_n,
+        )
+
+    return _submit_async_hook_work(
+        f"{dist.get_backend()}:recursive_doubling_zfp_online_coll:rate{bstate.rate:g}",
+        tensor,
+        _work,
+    )
+   
+# Explicit aliases with "naive" in the name to mirror the paper terminology.
+nccl_ring_zfp_naive_allreduce_hook = _ring_allreduce_zfp_hook
+mpi_ring_zfp_naive_allreduce_hook = _ring_allreduce_zfp_hook
+nccl_recursive_doubling_zfp_naive_allreduce_hook = _recursive_doubling_zfp_hook
+mpi_recursive_doubling_zfp_naive_allreduce_hook = _recursive_doubling_zfp_hook
+
+mpi_ring_zfp_online_coll_allreduce_hook = _ring_allreduce_zfp_online_coll_hook
+mpi_recursive_doubling_zfp_online_coll_allreduce_hook = _recursive_doubling_zfp_online_coll_hook
+
+ZFP_HIER_NUM_CHUNKS = int(os.getenv("DDP_ZFP_HIER_CHUNKS", "4"))
+
+#----
+# NCCL/RCCl zfp hierarchical allreduce hooks. These are not in the paper, but they are a natural extension of the online compression idea to hierarchical collectives.
+# They are only implemented for NCCL/RCCl because they require CUDA-aware P2P communication, which is not available in MPI. The hierarchical algorithm splits the tensor into chunks and performs a ring or recursive-doubling allreduce on each chunk in parallel, using separate CUDA streams for each chunk. This allows for better overlap
+
+ 
+# ═══════════════════════════════════════════════════════════════════════════════
+# TOPOLOGY DETECTION
+# ═══════════════════════════════════════════════════════════════════════════════
+ 
+@dataclass
+class _HierTopology:
+    """Resolved node/leader layout for the hierarchical hooks."""
+    world_size: int = 1
+    rank: int = 0
+    ppn: int = 1                     # ranks (GPUs) per node
+    num_nodes: int = 1
+    local_rank: int = 0
+    node_id: int = 0
+    is_leader: bool = False
+    leader_ranks: List[int] = field(default_factory=list)
+    # Filled lazily (needs a live process group):
+    local_group: Optional[object] = None    # this node's ranks
+    leader_group: Optional[object] = None    # one rank per node
+    usable: bool = False            # False → caller must fall back to native
+    reason: str = ""
+ 
+    def describe(self) -> str:
+        return (f"world={self.world_size} rank={self.rank} ppn={self.ppn} "
+                f"nodes={self.num_nodes} local_rank={self.local_rank} "
+                f"node_id={self.node_id} leader={self.is_leader} "
+                f"usable={self.usable} reason='{self.reason}'")
+ 
+ 
+def _ppn_from_env() -> Optional[int]:
+    """Ranks (GPUs) per node, read straight from the launcher environment.
+ 
+    Your srun launch sets SLURM_NTASKS_PER_NODE=PPN. For the Polaris/mpiexec
+    path the MPICH/PMI locals cover it. Set PPN explicitly (export PPN=$PPN in
+    the job script) to override anything. Returns None if nothing is found →
+    caller falls back to native allreduce.
+    """
+    for key in (
+        "PPN",                       # explicit, if you export it
+        "SLURM_NTASKS_PER_NODE",     # srun --ntasks-per-node (your Frontier launch)
+        "LOCAL_WORLD_SIZE",          # torchrun
+        "PALS_LOCAL_SIZE",           # Polaris PALS/mpiexec --ppn
+        "PMI_LOCAL_SIZE",            # PMI / Cray
+        "MPI_LOCALNRANKS",           # MPICH family
+    ):
+        val = os.getenv(key)
+        if not val:
+            continue
+        # Handle SLURM's "8(x4)" form by taking the leading integer.
+        digits = ""
+        for ch in val:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if digits and int(digits) > 0:
+            return int(digits)
+    return None
+ 
+ 
+def _resolve_topology(tensor: torch.Tensor) -> _HierTopology:
+    """Node/leader layout from ppn + block placement. Never raises — on any
+    problem returns usable=False so the caller falls back to native.
+ 
+    Placement assumption: srun --ntasks-per-node (default block distribution)
+    puts ranks [0..ppn), [ppn..2*ppn), ... on successive nodes. So
+    node_id = rank // ppn, local_rank = rank % ppn, leader = local_rank 0.
+    """
+    topo = _HierTopology()
+    if not (dist.is_available() and dist.is_initialized()):
+        topo.reason = "distributed not initialized"
+        return topo
+ 
+    topo.world_size = dist.get_world_size()
+    topo.rank = dist.get_rank()
+ 
+    if topo.world_size == 1:
+        topo.reason = "world_size==1"
+        return topo
+ 
+    ppn = _ppn_from_env()
+    if ppn is None:
+        topo.reason = "no ppn env var (set PPN or SLURM_NTASKS_PER_NODE)"
+        return topo
+    if topo.world_size % ppn != 0:
+        topo.reason = f"world_size={topo.world_size} not divisible by ppn={ppn}"
+        return topo
+ 
+    topo.ppn = ppn
+    topo.num_nodes = topo.world_size // ppn
+    if topo.num_nodes < 2:
+        topo.reason = "single node → native allreduce is optimal"
+        return topo
+ 
+    topo.node_id = topo.rank // ppn
+    topo.local_rank = topo.rank % ppn
+    topo.is_leader = (topo.local_rank == 0)
+    topo.leader_ranks = [n * ppn for n in range(topo.num_nodes)]
+    topo.usable = True
+    topo.reason = "ok"
+    return topo
+ 
+ 
+# ── Process-group cache ──────────────────────────────────────────────────────
+# new_group() is collective: ALL ranks must call it in the same order. We build
+# the per-node groups and the leader group once, keyed by (ppn, num_nodes).
+_HIER_GROUP_CACHE: Dict[tuple, dict] = {}
+_HIER_GROUP_LOCK = threading.Lock()
+ 
+ 
+def _build_hier_groups(topo: _HierTopology) -> Optional[dict]:
+    """Create (or fetch cached) this node's local group + the leader group.
+ 
+    Every rank iterates the SAME node list in the SAME order and calls new_group
+    for each, so all ranks agree. Returns {'local_group', 'leader_group'} or
+    None on failure (caller falls back to native)."""
+    sig = (topo.ppn, topo.num_nodes)
+    with _HIER_GROUP_LOCK:
+        cached = _HIER_GROUP_CACHE.get(sig)
+        if cached is not None:
+            return cached
+        try:
+            local_group = None
+            for n in range(topo.num_nodes):
+                members = list(range(n * topo.ppn, (n + 1) * topo.ppn))
+                g = dist.new_group(ranks=members)
+                if topo.node_id == n:
+                    local_group = g
+            leader_group = dist.new_group(ranks=topo.leader_ranks)
+            result = {"local_group": local_group, "leader_group": leader_group}
+            _HIER_GROUP_CACHE[sig] = result
+            return result
+        except Exception as exc:
+            print(f"[HIER_ZFP] new_group failed: {exc} — falling back to native",
+                  flush=True)
+            return None
+ 
+ 
+# ═══════════════════════════════════════════════════════════════════════════════
+# STATE
+# ═══════════════════════════════════════════════════════════════════════════════
+ 
+@dataclass
+class ZfpHierBucketState:
+    """Persistent buffers for the hierarchical pipelined ZFP hooks, per bucket.
+ 
+    Only leaders allocate the inter-node compression buffers. Non-leaders keep
+    just the flat scratch used for the intra-node collectives.
+    """
+    flat: Optional[torch.Tensor] = None          # full bucket scratch (all ranks)
+    rate: float = 16.0
+    bucket_id: int = 0
+    call_count: int = 0
+ 
+    # Topology (resolved once, reused).
+    topo: Optional[_HierTopology] = None
+ 
+    # Leader-only inter-node buffers. Sized against the *padded* leader buffer so
+    # that num_leaders and num_chunks both divide it evenly.
+    leader_numel: int = 0                        # padded length used inter-node
+    shard_numel: int = 0                         # leader_numel // num_leaders
+    num_chunks: int = 1
+    chunk_shard: int = 0                         # shard_numel // num_chunks
+ 
+    comp_bytes_shard_chunk: int = 0              # ZFP max bytes for one shard-chunk
+ 
+    # Pipeline streams.
+    comp_stream: Optional[torch.cuda.Stream] = None
+    comm_stream: Optional[torch.cuda.Stream] = None
+    decomp_stream: Optional[torch.cuda.Stream] = None
+ 
+    # Phase-1 (reduce-scatter) buffers, one entry per chunk.
+    p1_send_comp: List[torch.Tensor] = field(default_factory=list)  # [num_leaders*comp_bytes] per chunk
+    p1_recv_comp: List[torch.Tensor] = field(default_factory=list)
+    p1_recv_decomp: List[torch.Tensor] = field(default_factory=list)  # [num_leaders*chunk_shard]
+ 
+    # Phase-2 (all-gather) buffers, one entry per chunk.
+    p2_send_comp: List[torch.Tensor] = field(default_factory=list)  # [comp_bytes] per chunk
+    p2_recv_comp: List[torch.Tensor] = field(default_factory=list)  # [num_leaders*comp_bytes]
+ 
+    leader_buf: Optional[torch.Tensor] = None    # padded leader-group work buffer
+    my_shard: Optional[torch.Tensor] = None      # this leader's reduced shard view
+ 
+    def initialize(self, tensor: torch.Tensor, topo: _HierTopology,
+                   rate: float, num_chunks: int, bucket_id: int) -> None:
+        _require_zfp_cuda()
+        self.rate = rate
+        self.bucket_id = bucket_id
+        self.topo = topo
+        device = tensor.device
+        numel = tensor.numel()
+ 
+        self.flat = torch.empty(numel, dtype=tensor.dtype, device=device)
+ 
+        # Pipeline streams (shared by both phases).
+        self.comp_stream = torch.cuda.Stream(device=device)
+        self.comm_stream = torch.cuda.Stream(device=device)
+        self.decomp_stream = torch.cuda.Stream(device=device)
+ 
+        if not topo.is_leader:
+            # Non-leaders never touch the compressed path.
+            return
+ 
+        cfg = ZfpCompressionConfig(rate=rate)
+        L = topo.num_nodes                      # number of leaders
+ 
+        # Pad the bucket length so L and num_chunks both divide it. Padding lives
+        # only inside the leader buffer; the tail is zero and contributes 0 to the
+        # sum, so correctness is unaffected.
+        nchunks = max(1, num_chunks)
+        gran = L * nchunks
+        padded = ((numel + gran - 1) // gran) * gran
+        self.leader_numel = padded
+        self.shard_numel = padded // L
+        self.num_chunks = nchunks
+        self.chunk_shard = self.shard_numel // nchunks
+ 
+        self.leader_buf = torch.zeros(padded, dtype=tensor.dtype, device=device)
+        # This leader owns shard index == its node_id (its position in the
+        # leader group, which is ordered by node under block placement).
+        my_pos = topo.node_id
+        self.my_shard = self.leader_buf.narrow(
+            0, my_pos * self.shard_numel, self.shard_numel)
+ 
+        # ZFP max bytes for a single shard-chunk (the compression granularity).
+        probe = torch.empty(self.chunk_shard, dtype=tensor.dtype, device=device)
+        cb = int(_zfp_max_output_bytes(probe, cfg.rate))
+        self.comp_bytes_shard_chunk = cb
+ 
+        # Phase-1 buffers: each rank sends L shard-chunks (one per destination
+        # leader) and receives L shard-chunks into a contiguous decomp buffer.
+        self.p1_send_comp = [
+            torch.empty(L * cb, dtype=torch.uint8, device=device)
+            for _ in range(nchunks)
+        ]
+        self.p1_recv_comp = [
+            torch.empty(L * cb, dtype=torch.uint8, device=device)
+            for _ in range(nchunks)
+        ]
+        self.p1_recv_decomp = [
+            torch.empty(L * self.chunk_shard, dtype=tensor.dtype, device=device)
+            for _ in range(nchunks)
+        ]
+ 
+        # Phase-2 buffers: each rank sends its own 1 shard-chunk (compressed) and
+        # all-gathers L of them.
+        self.p2_send_comp = [
+            torch.empty(cb, dtype=torch.uint8, device=device)
+            for _ in range(nchunks)
+        ]
+        self.p2_recv_comp = [
+            torch.empty(L * cb, dtype=torch.uint8, device=device)
+            for _ in range(nchunks)
+        ]
+ 
+ 
+@dataclass
+class ZfpHierAllreduceState:
+    """DDP-hook state: per-bucket ZfpHierBucketState, plus resolved groups."""
+    rate: float = 16.0
+    num_chunks: int = ZFP_HIER_NUM_CHUNKS
+    buckets: Dict[int, ZfpHierBucketState] = field(default_factory=dict)
+    # Cache the group resolution once for the whole run.
+    _groups_ready: bool = False
+    _native_fallback: bool = False
+    _fallback_reason: str = ""
+    _fallback_logged: bool = False
+ 
+    def get_or_init(self, bucket_index: int, tensor: torch.Tensor
+                    ) -> Optional[ZfpHierBucketState]:
+        bs = self.buckets.get(bucket_index)
+        if bs is not None and bs.flat is not None and bs.flat.numel() == tensor.numel():
+            return bs
+ 
+        topo = _resolve_topology(tensor)
+        if not topo.usable:
+            self._native_fallback = True
+            self._fallback_reason = topo.reason
+            return None
+ 
+        groups = _build_hier_groups(topo)
+        if groups is None:
+            self._native_fallback = True
+            self._fallback_reason = "group creation failed"
+            return None
+        topo.local_group = groups["local_group"]
+        topo.leader_group = groups["leader_group"]
+ 
+        bs = ZfpHierBucketState()
+        bs.initialize(tensor, topo, self.rate, self.num_chunks, bucket_index)
+        self.buckets[bucket_index] = bs
+        return bs
+ 
+ 
+# ═══════════════════════════════════════════════════════════════════════════════
+# CORE: hierarchical pipelined allreduce over the leader group
+# ═══════════════════════════════════════════════════════════════════════════════
+ 
+def _leader_compressed_allreduce_(bstate: ZfpHierBucketState, log: bool,
+                                  call_n: int) -> None:
+    """Run the two-phase, chunk-pipelined compressed allreduce IN PLACE on
+    bstate.leader_buf, across the leader group. Leaders only."""
+    topo = bstate.topo
+    lg = topo.leader_group
+    L = topo.num_nodes
+    cfg = ZfpCompressionConfig(rate=bstate.rate)
+    cb = bstate.comp_bytes_shard_chunk
+    cshard = bstate.chunk_shard
+ 
+    comp_s = bstate.comp_stream
+    comm_s = bstate.comm_stream
+    dec_s = bstate.decomp_stream
+ 
+    # All side streams must wait for whatever produced leader_buf (the copy that
+    # staged the node-reduced gradient into it, enqueued on the current stream).
+    cur = torch.cuda.current_stream(device=bstate.leader_buf.device)
+    for s in (comp_s, comm_s, dec_s):
+        s.wait_stream(cur)
+ 
+    view2d = bstate.leader_buf.view(L, bstate.shard_numel)  # [L, shard_numel]
+ 
+    # ── PHASE 1: reduce-scatter (compress the L shard-chunks we send) ─────────
+    for c in range(bstate.num_chunks):
+        off = c * cshard
+        # Gather the c-th shard-chunk of every destination shard into a
+        # contiguous [L, cshard] region and compress each into p1_send_comp[c].
+        send_comp = bstate.p1_send_comp[c]
+        with torch.cuda.stream(comp_s):
+            for j in range(L):
+                src = view2d[j].narrow(0, off, cshard)
+                dst = send_comp.narrow(0, j * cb, cb)
+                used_bits = _zfp_compress_into_current_stream(src, dst, cfg.rate)
+                _zfp_pad_tail_to_B_(dst, used_bits, cb)
+        ev_c = torch.cuda.Event()
+        ev_c.record(comp_s)
+ 
+        # all_to_all_single: rank r sends block j to leader j. Equal split sizes
+        # because fixed-rate ZFP is deterministic → uniform cb per block.
+        comm_s.wait_event(ev_c)
+        recv_comp = bstate.p1_recv_comp[c]
+        with torch.cuda.stream(comm_s):
+            dist.all_to_all_single(recv_comp, send_comp, group=lg)
+        ev_m = torch.cuda.Event()
+        ev_m.record(comm_s)
+ 
+        # Decompress the L received shard-chunks and sum them into my_shard[off:].
+        dec_s.wait_event(ev_m)
+        recv_decomp = bstate.p1_recv_decomp[c]
+        with torch.cuda.stream(dec_s):
+            for j in range(L):
+                comp_blk = recv_comp.narrow(0, j * cb, cb)
+                out_blk = recv_decomp.narrow(0, j * cshard, cshard)
+                _zfp_decompress_into_current_stream(comp_blk, cb, out_blk, cfg.rate)
+            # Sum the L contributions into this leader's shard-chunk.
+            acc = recv_decomp.view(L, cshard).sum(dim=0)
+            bstate.my_shard.narrow(0, off, cshard).copy_(acc)
+ 
+    # Make sure phase-1 reductions are visible before phase-2 compresses my_shard.
+    ev_p1 = torch.cuda.Event()
+    ev_p1.record(dec_s)
+    comp_s.wait_event(ev_p1)
+ 
+    # ── PHASE 2: all-gather (compress our 1 finished shard-chunk each step) ────
+    for c in range(bstate.num_chunks):
+        off = c * cshard
+        send_comp = bstate.p2_send_comp[c]
+        with torch.cuda.stream(comp_s):
+            src = bstate.my_shard.narrow(0, off, cshard)
+            used_bits = _zfp_compress_into_current_stream(src, send_comp, cfg.rate)
+            _zfp_pad_tail_to_B_(send_comp, used_bits, cb)
+        ev_c = torch.cuda.Event()
+        ev_c.record(comp_s)
+ 
+        comm_s.wait_event(ev_c)
+        recv_comp = bstate.p2_recv_comp[c]
+        with torch.cuda.stream(comm_s):
+            dist.all_gather_into_tensor(recv_comp, send_comp, group=lg)
+        ev_m = torch.cuda.Event()
+        ev_m.record(comm_s)
+ 
+        # Decompress leader j's shard-chunk directly into shard j's slot.
+        dec_s.wait_event(ev_m)
+        with torch.cuda.stream(dec_s):
+            for j in range(L):
+                comp_blk = recv_comp.narrow(0, j * cb, cb)
+                out_blk = view2d[j].narrow(0, off, cshard)
+                _zfp_decompress_into_current_stream(comp_blk, cb, out_blk, cfg.rate)
+ 
+    # Serialize the pipeline back onto the current stream before the caller
+    # reads leader_buf.
+    ev_done = torch.cuda.Event()
+    ev_done.record(dec_s)
+    cur.wait_event(ev_done)
+ 
+    if log:
+        print(f"[HIER_ZFP|R{topo.rank}|B{bstate.bucket_id}|C{call_n}] "
+              f"leader allreduce done L={L} chunks={bstate.num_chunks} "
+              f"shard={bstate.shard_numel} cb={cb}", flush=True)
+ 
+ 
+def _hier_zfp_allreduce_sum(tensor: torch.Tensor, bstate: ZfpHierBucketState,
+                            log: bool, call_n: int = 0) -> None:
+    """Full hierarchical allreduce. Produces the AVERAGED gradient in `tensor`.
+ 
+    Step 1: native SUM all_reduce intra-node (NVLink, uncompressed).
+    Step 2: compressed pipelined allreduce across leaders (leaders only).
+    Step 3: native broadcast intra-node from leader.
+    Then divide by world_size.
+    """
+    _require_zfp_cuda()
+    topo = bstate.topo
+    world_size = topo.world_size
+ 
+    flat = bstate.flat
+    flat.copy_(tensor.flatten())
+ 
+    # ── Step 1: intra-node SUM reduce (native, uncompressed) ─────────────────
+    dist.all_reduce(flat, op=dist.ReduceOp.SUM, group=topo.local_group)
+    # Now every rank on the node holds the node-local sum. Leaders proceed to
+    # inter-node; non-leaders wait for the broadcast.
+ 
+    # ── Step 2: inter-node compressed allreduce (leaders only) ───────────────
+    if topo.is_leader:
+        # Stage the node-sum into the padded leader buffer (tail stays zero).
+        bstate.leader_buf.narrow(0, 0, flat.numel()).copy_(flat)
+        if bstate.leader_numel > flat.numel():
+            bstate.leader_buf.narrow(
+                0, flat.numel(),
+                bstate.leader_numel - flat.numel()).zero_()
+        _leader_compressed_allreduce_(bstate, log, call_n)
+        # Copy the reduced (global-sum) result back into flat.
+        flat.copy_(bstate.leader_buf.narrow(0, 0, flat.numel()))
+ 
+    # ── Step 3: intra-node broadcast from the node leader ────────────────────
+    # Leader is local_rank 0 → global src is the first member of this node.
+    src_global = topo.leader_ranks[topo.node_id]
+    dist.broadcast(flat, src=src_global, group=topo.local_group)
+ 
+    # DDP expects the averaged gradient.
+    flat.div_(world_size)
+    tensor.copy_(flat.view_as(tensor))
+    _cuda_sync(tensor)
+ 
+ 
+# ═══════════════════════════════════════════════════════════════════════════════
+# HOOKS
+# ═══════════════════════════════════════════════════════════════════════════════
+ 
+def _hier_zfp_online_coll_hook(
+    state: ZfpHierAllreduceState,
+    bucket: dist.GradBucket,
+) -> torch.futures.Future[torch.Tensor]:
+    """DDP hook: hierarchical pipelined online ZFP allreduce for NCCL/RCCL.
+ 
+    Falls back to native allreduce (with pre-division) when the topology isn't
+    a clean multi-node layout, or when ZFP / group creation is unavailable.
+    """
+    tensor = bucket.buffer()
+    bucket_index = bucket.index()
+ 
+    bstate = state.get_or_init(bucket_index, tensor)
+ 
+    if bstate is None:
+        # Native fallback path — behaves exactly like the default hook.
+        if (
+            state._native_fallback
+            and dist.get_rank() == 0
+            and bucket_index == 0
+            and not state._fallback_logged
+        ):
+            print(f"[HIER_ZFP] native fallback: {state._fallback_reason}",
+                  flush=True)
+            state._fallback_logged = True
+        tensor.div_(dist.get_world_size())
+        return dist.all_reduce(
+            tensor, op=dist.ReduceOp.SUM, async_op=True
+        ).get_future().then(lambda f: f.value()[0])
+ 
+    bstate.call_count += 1
+    call_n = bstate.call_count
+    rank = dist.get_rank()
+    do_full_log = (FULL_LOG_CALLS > 0 and call_n <= FULL_LOG_CALLS)
+ 
+    if do_full_log:
+        # Keep this block non-empty so the file remains valid while suppressing
+        # repeated verbose per-bucket logging.
+        pass
+
+    def _work() -> None:
+        _hier_zfp_allreduce_sum(tensor, bstate, log=do_full_log, call_n=call_n)
+ 
+    return _submit_async_hook_work(
+        f"{dist.get_backend()}:hier_zfp_online_coll:rate{bstate.rate:g}",
+        tensor,
+        _work,
+    )
+
+nccl_ring_zfp_online_coll_allreduce_hook = _hier_zfp_online_coll_hook
+nccl_recursive_doubling_zfp_online_coll_allreduce_hook = _hier_zfp_online_coll_hook
+
+nccl_hier_zfp_online_coll_allreduce_hook = _hier_zfp_online_coll_hook
+
+
+# ── HIERARCHICAL ZFP — MPI BACKEND ───────────────────────────────────────────
+# Same algorithm/buffers as NCCL. ProcessGroupMPI is not stream-ordered, so:
+# send buffers fenced with event.synchronize(), recv buffers read only after
+# work.wait(), overlap via async collectives. Phase 2 uses alltoall with a
+# replicated send block (MPI PG has no all_gather_into_tensor).
+
+def _build_hier_groups_mpi(topo: _HierTopology) -> Optional[dict]:
+    """Do NOT use dist.new_group on MPI: ProcessGroupMPI.create does
+    MPI_Barrier + MPI_Comm_create on MPI_COMM_WORLD, but new_group returns
+    early on non-members, so the leader group deadlocks. Here every rank calls
+    ProcessGroupMPI.create for every group (returns None on non-members)."""
+    from torch._C._distributed_c10d import ProcessGroupMPI
+    sig = ("mpi", topo.ppn, topo.num_nodes)
+    with _HIER_GROUP_LOCK:
+        cached = _HIER_GROUP_CACHE.get(sig)
+        if cached is not None:
+            return cached
+        try:
+            local_group = None
+            for n in range(topo.num_nodes):
+                g = ProcessGroupMPI.create(list(range(n * topo.ppn, (n + 1) * topo.ppn)))
+                if topo.node_id == n:
+                    local_group = g
+            leader_group = ProcessGroupMPI.create(list(topo.leader_ranks))  # None on non-leaders
+            if local_group is None or (topo.is_leader and leader_group is None):
+                raise RuntimeError("ProcessGroupMPI.create returned None for a member")
+            result = {"local_group": local_group, "leader_group": leader_group}
+            _HIER_GROUP_CACHE[sig] = result
+            return result
+        except Exception as exc:
+            print(f"[HIER_ZFP_MPI] group creation failed: {exc} — falling back to native",
+                  flush=True)
+            return None
+
+
+@dataclass
+class ZfpHierMpiBucketState(ZfpHierBucketState):
+    def initialize(self, tensor, topo, rate, num_chunks, bucket_id) -> None:
+        super().initialize(tensor, topo, rate, num_chunks, bucket_id)
+        if not topo.is_leader:
+            return
+        L, cb = topo.num_nodes, self.comp_bytes_shard_chunk
+        self.p2_send_comp = [
+            torch.empty(L * cb, dtype=torch.uint8, device=tensor.device)
+            for _ in range(self.num_chunks)
+        ]
+
+
+@dataclass
+class ZfpHierMpiAllreduceState(ZfpHierAllreduceState):
+    num_chunks: int = int(os.getenv("DDP_ZFP_HIER_MPI_CHUNKS",
+                                    str(ZFP_HIER_NUM_CHUNKS)))
+
+    def get_or_init(self, bucket_index, tensor):
+        bs = self.buckets.get(bucket_index)
+        if bs is not None and bs.flat is not None and bs.flat.numel() == tensor.numel():
+            return bs
+        topo = _resolve_topology(tensor)
+        if not topo.usable:
+            self._native_fallback, self._fallback_reason = True, topo.reason
+            return None
+        groups = _build_hier_groups_mpi(topo)
+        if groups is None:
+            self._native_fallback, self._fallback_reason = True, "group creation failed"
+            return None
+        topo.local_group = groups["local_group"]
+        topo.leader_group = groups["leader_group"]
+        bs = ZfpHierMpiBucketState()
+        bs.initialize(tensor, topo, self.rate, self.num_chunks, bucket_index)
+        self.buckets[bucket_index] = bs
+        return bs
+
+    def prepare(self) -> None:
+        """Create the MPI groups at registration, on all ranks, outside backward."""
+        topo = _resolve_topology(None)
+        if topo.usable:
+            _build_hier_groups_mpi(topo)
+        if dist.get_rank() == 0:
+            print(f"[HIER_ZFP_MPI] groups ready: {topo.reason} ppn={topo.ppn} "
+                  f"nodes={topo.num_nodes}", flush=True)
+
+
+def _leader_compressed_allreduce_mpi_(bstate, log: bool, call_n: int) -> None:
+    topo, lg, L = bstate.topo, bstate.topo.leader_group, bstate.topo.num_nodes
+    rate, cb, cshard = bstate.rate, bstate.comp_bytes_shard_chunk, bstate.chunk_shard
+    nchunks, comp_s, dec_s = bstate.num_chunks, bstate.comp_stream, bstate.decomp_stream
+
+    cur = torch.cuda.current_stream(device=bstate.leader_buf.device)
+    comp_s.wait_stream(cur)
+    dec_s.wait_stream(cur)
+    view2d = bstate.leader_buf.view(L, bstate.shard_numel)
+
+    def p1_compress(c):
+        off, send = c * cshard, bstate.p1_send_comp[c]
+        with torch.cuda.stream(comp_s):
+            for j in range(L):
+                dst = send.narrow(0, j * cb, cb)
+                ub = _zfp_compress_into_current_stream(view2d[j].narrow(0, off, cshard), dst, rate)
+                _zfp_pad_tail_to_B_(dst, ub, cb)
+        ev = torch.cuda.Event(); ev.record(comp_s); return ev
+
+    def p1_decompress(c):
+        off, rc, rd = c * cshard, bstate.p1_recv_comp[c], bstate.p1_recv_decomp[c]
+        with torch.cuda.stream(dec_s):
+            for j in range(L):
+                _zfp_decompress_into_current_stream(
+                    rc.narrow(0, j * cb, cb), cb, rd.narrow(0, j * cshard, cshard), rate)
+            bstate.my_shard.narrow(0, off, cshard).copy_(rd.view(L, cshard).sum(dim=0))
+
+    def p2_compress(c):
+        off, s2 = c * cshard, bstate.p2_send_comp[c].view(L, cb)
+        with torch.cuda.stream(comp_s):
+            ub = _zfp_compress_into_current_stream(bstate.my_shard.narrow(0, off, cshard), s2[0], rate)
+            _zfp_pad_tail_to_B_(s2[0], ub, cb)
+            if L > 1:
+                s2[1:].copy_(s2[0:1].expand(L - 1, cb))
+        ev = torch.cuda.Event(); ev.record(comp_s); return ev
+
+    def p2_decompress(c):
+        off, rc = c * cshard, bstate.p2_recv_comp[c]
+        with torch.cuda.stream(dec_s):
+            for j in range(L):
+                _zfp_decompress_into_current_stream(
+                    rc.narrow(0, j * cb, cb), cb, view2d[j].narrow(0, off, cshard), rate)
+
+    def run_phase(compress, decompress, send_bufs, recv_bufs):
+        pending = None
+        for c in range(nchunks):
+            compress(c).synchronize()          # bytes in HBM before MPI RDMA
+            work = lg.alltoall_base(recv_bufs[c], send_bufs[c], [], [])   # raw MPI Backend, equal splits
+            if pending is not None:
+                pending[1].wait(); decompress(pending[0])
+            pending = (c, work)
+        pending[1].wait(); decompress(pending[0])
+
+    run_phase(p1_compress, p1_decompress, bstate.p1_send_comp, bstate.p1_recv_comp)
+    ev_p1 = torch.cuda.Event(); ev_p1.record(dec_s); comp_s.wait_event(ev_p1)
+    run_phase(p2_compress, p2_decompress, bstate.p2_send_comp, bstate.p2_recv_comp)
+
+    ev_done = torch.cuda.Event(); ev_done.record(dec_s); cur.wait_event(ev_done)
+    if log:
+        print(f"[HIER_ZFP_MPI|R{topo.rank}|B{bstate.bucket_id}|C{call_n}] "
+              f"L={L} chunks={nchunks} shard={bstate.shard_numel} cb={cb}", flush=True)
+
+
+def _hier_zfp_allreduce_mpi_sum(tensor, bstate, log: bool, call_n: int = 0) -> None:
+    _require_zfp_cuda()
+    topo, flat = bstate.topo, bstate.flat
+    flat.copy_(tensor.flatten())
+    _cuda_sync(flat)
+    topo.local_group.allreduce(flat, dist.ReduceOp.SUM).wait()
+    if topo.is_leader:
+        n = flat.numel()
+        bstate.leader_buf.narrow(0, 0, n).copy_(flat)
+        if bstate.leader_numel > n:
+            bstate.leader_buf.narrow(0, n, bstate.leader_numel - n).zero_()
+        _leader_compressed_allreduce_mpi_(bstate, log, call_n)
+        flat.copy_(bstate.leader_buf.narrow(0, 0, n))
+        _cuda_sync(flat)
+    topo.local_group.broadcast(flat, 0).wait()   # leader is rank 0 of its node group
+    flat.div_(topo.world_size)
+    tensor.copy_(flat.view_as(tensor))
+    _cuda_sync(tensor)
+
+
+def _hier_zfp_online_coll_mpi_hook(state, bucket):
+    tensor, bucket_index = bucket.buffer(), bucket.index()
+    bstate = state.get_or_init(bucket_index, tensor)
+    if bstate is None:
+        if dist.get_rank() == 0 and bucket_index == 0 and not state._fallback_logged:
+            print(f"[HIER_ZFP_MPI] native fallback: {state._fallback_reason}", flush=True)
+            state._fallback_logged = True
+        tensor.div_(dist.get_world_size())
+        return dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True
+                               ).get_future().then(lambda f: f.value()[0])
+    bstate.call_count += 1
+    call_n = bstate.call_count
+    do_log = FULL_LOG_CALLS > 0 and call_n <= FULL_LOG_CALLS
+    return _submit_async_hook_work(
+        f"{dist.get_backend()}:hier_zfp_online_coll:rate{bstate.rate:g}", tensor,
+        lambda: _hier_zfp_allreduce_mpi_sum(tensor, bstate, log=do_log, call_n=call_n))
+
+
+mpi_hier_zfp_online_coll_allreduce_hook = _hier_zfp_online_coll_mpi_hook
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DIRECT SENDRECV ALLREDUCE WITH THROTTLING
+# Chen, Yao, Subramoni, Panda — "Design and Optimization of GPU-Aware MPI
+# Allreduce Using Direct Sendrecv Communication", ICPP '25.
+#
+#   Reduce-Scatter (Alg. 1) + Allgather (Alg. 3), same chunking as the ring.
+#   Rank r owns chunk r. Peers are visited in batches of `throttle`:
+#     batch ii: k = ii .. ii+ss-1   (k = 0 is "myself", skipped)
+#       RS : irecv chunk r of rank (r+k)  into tmp      | isend my chunk (r-k) to rank (r-k)
+#       AG : irecv chunk (r+k) from rank (r+k) in place | isend my chunk r       to rank (r-k)
+#   Every rank uses the same k for a given pair in the same batch, so all
+#   sends/recvs match and no ordering deadlock is possible.
+#
+#   Paper optimizations (Sec. 3.4):
+#     - overlap:      the reduction of batch b is enqueued on the GPU stream
+#                     and runs while the host posts batch b+1's communication.
+#                     tmp is double-buffered so batch b+1 never writes rows that
+#                     batch b's reduction is still reading.
+#     - kernel fusion: one reduction per batch over all received rows
+#                     (sum over the batch, then a single add into chunk r),
+#                     instead of one Reduce_local per peer.
+#
+#   Throttle: DDP_DIRECT_THROTTLE env var (default 8), or "direct_t<N>" as the
+#   algorithm name (e.g. COMM_ALGORITHM=direct_t16). Paper Fig. 4: best 8 for
+#   32-512 MB on 64 GPUs, 32 for 8 MB, 4 for 1 GB.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+DIRECT_DEFAULT_THROTTLE = int(os.getenv("DDP_DIRECT_THROTTLE", "8"))
+
+
+@dataclass
+class DirectBucketState:
+    """Persistent buffers for one DDP bucket (paper: persistent tmp buffer)."""
+    flat:      Optional[torch.Tensor] = None   # sendbuf / recvbuf (in place)
+    tmp:       Optional[torch.Tensor] = None   # [2, throttle, max_cnt]  double-buffered
+    red_buf:   Optional[torch.Tensor] = None   # [max_cnt]  fused-reduction output
+    cnts:      List[int]              = field(default_factory=list)
+    displs:    List[int]              = field(default_factory=list)
+    throttle:  int                    = 8
+    bucket_id: int                    = 0
+    call_count: int                   = 0
+    stream:    Optional[torch.cuda.Stream] = None
+    red_done:  List[Optional[torch.cuda.Event]] = field(default_factory=list)
+
+    def initialize(self, tensor: torch.Tensor, world_size: int,
+                   bucket_id: int, throttle: int) -> None:
+        numel      = tensor.numel()
+        base_chunk = math.ceil(numel / world_size)
+
+        total = 0
+        self.cnts = []
+        for _ in range(world_size):
+            c = min(base_chunk, numel - total)
+            self.cnts.append(max(c, 0))
+            total += self.cnts[-1]
+        self.displs = [0]
+        for i in range(1, world_size):
+            self.displs.append(self.displs[-1] + self.cnts[i - 1])
+
+        self.throttle = max(1, min(throttle, world_size))
+        max_cnt = max(max(self.cnts), 1)
+        dev, dt = tensor.device, tensor.dtype
+        self.flat    = torch.empty(numel, dtype=dt, device=dev)
+        self.tmp     = torch.empty(2, self.throttle, max_cnt, dtype=dt, device=dev)
+        self.red_buf = torch.empty(max_cnt, dtype=dt, device=dev)
+        self.bucket_id = bucket_id
+        if tensor.is_cuda:
+            self.stream   = torch.cuda.Stream(device=dev)
+            self.red_done = [torch.cuda.Event(), torch.cuda.Event()]
+        else:
+            self.stream   = None
+            self.red_done = [None, None]
+
+
+@dataclass
+class DirectAllreduceState:
+    """Per-bucket Direct state, keyed by DDP bucket index (like RingAllreduceState)."""
+    throttle: int = DIRECT_DEFAULT_THROTTLE
+    buckets:  Dict[int, DirectBucketState] = field(default_factory=dict)
+    announced: bool = False
+
+    def get_or_init(self, bucket_index: int, tensor: torch.Tensor,
+                    world_size: int) -> DirectBucketState:
+        bs = self.buckets.get(bucket_index)
+        if bs is None or bs.flat is None or bs.flat.numel() != tensor.numel():
+            bs = DirectBucketState()
+            bs.initialize(tensor, world_size, bucket_index, self.throttle)
+            self.buckets[bucket_index] = bs
+        return bs
+
+
+def _direct_allreduce_sum(tensor: torch.Tensor, bstate: DirectBucketState) -> None:
+    """In-place Direct Sendrecv allreduce (mean) of `tensor`."""
+    rank       = dist.get_rank()
+    world_size = dist.get_world_size()
+    if world_size == 1:
+        return
+
+    P, r, t = world_size, rank, bstate.throttle
+    cnts, displs = bstate.cnts, bstate.displs
+    my_cnt = cnts[r]
+
+    def chunk(i: int) -> torch.Tensor:
+        return bstate.flat[displs[i]: displs[i] + cnts[i]]
+
+    stream = bstate.stream if tensor.is_cuda else None
+    if stream is not None:
+        stream.wait_stream(torch.cuda.current_stream(device=tensor.device))
+    ctx = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
+
+    with ctx:
+        bstate.flat.copy_(tensor.flatten())
+        _ring_sync(bstate, bstate.flat)      # GPU-direct MPI reads memory directly
+
+        # ── Phase 1: Direct Reduce-Scatter (Alg. 1) ──────────────────────────
+        _nvtx_range_push(f"direct_reduce_scatter:B{bstate.bucket_id} rank={r} t={t}")
+        for b, ii in enumerate(range(0, P, t)):
+            ss   = min(P - ii, t)
+            half = b % 2
+            # Double buffer: rows of `half` were last read by batch b-2's
+            # reduction; it must be finished before MPI writes into them.
+            if b >= 2 and bstate.red_done[half] is not None:
+                bstate.red_done[half].synchronize()
+
+            tag  = _next_tag()
+            ops  = []
+            rows = []                              # tmp rows that receive data
+            for i in range(ss):
+                k = i + ii
+                if k % P == 0:
+                    continue                       # myself
+                src = (r + k) % P                  # its copy of MY chunk r
+                dst = (r - k) % P                  # gets MY copy of ITS chunk
+                if my_cnt > 0:
+                    ops.append(dist.P2POp(dist.irecv,
+                                          bstate.tmp[half, i, :my_cnt], src, tag=tag))
+                    rows.append(i)
+                if cnts[dst] > 0:
+                    ops.append(dist.P2POp(dist.isend, chunk(dst), dst, tag=tag))
+            if ops:
+                for req in dist.batch_isend_irecv(ops):
+                    req.wait()                     # MPI_Waitall for this batch
+
+            if rows:
+                # Fused reduction: one sum over every row received in this
+                # batch, one add into my chunk. Enqueued on the stream; the
+                # host moves on to post the next batch (overlap).
+                lo, hi = rows[0], rows[-1] + 1     # rows are contiguous
+                torch.sum(bstate.tmp[half, lo:hi, :my_cnt], dim=0,
+                          out=bstate.red_buf[:my_cnt])
+                chunk(r).add_(bstate.red_buf[:my_cnt])
+                if bstate.red_done[half] is not None:
+                    bstate.red_done[half].record(stream)
+        _nvtx_range_pop()
+
+        # Chunk r is complete only when the last reductions have run.
+        _ring_sync(bstate, bstate.flat)
+
+        # ── Phase 2: Direct Allgather (Alg. 3) ───────────────────────────────
+        _nvtx_range_push(f"direct_allgather:B{bstate.bucket_id} rank={r} t={t}")
+        for ii in range(0, P, t):
+            ss  = min(P - ii, t)
+            tag = _next_tag()
+            ops = []
+            for i in range(ss):
+                k = i + ii
+                if k % P == 0:
+                    continue
+                src = (r + k) % P                  # its reduced chunk, in place
+                dst = (r - k) % P                  # gets my reduced chunk r
+                if cnts[src] > 0:
+                    ops.append(dist.P2POp(dist.irecv, chunk(src), src, tag=tag))
+                if my_cnt > 0:
+                    ops.append(dist.P2POp(dist.isend, chunk(r), dst, tag=tag))
+            if ops:
+                for req in dist.batch_isend_irecv(ops):
+                    req.wait()
+        _nvtx_range_pop()
+
+        tensor.copy_(bstate.flat.view_as(tensor))
+        tensor.div_(world_size)
+    _ring_sync(bstate, tensor)   # result landed before the future resolves
+
+
+def _direct_allreduce_hook(
+    state:  DirectAllreduceState,
+    bucket: dist.GradBucket,
+) -> torch.futures.Future[torch.Tensor]:
+    tensor     = bucket.buffer()
+    world_size = dist.get_world_size()
+    bstate = state.get_or_init(bucket.index(), tensor, world_size)
+    bstate.call_count += 1
+
+    if not state.announced:
+        state.announced = True
+        if dist.get_rank() == 0:
+            print(f"[DIRECT] Direct Sendrecv allreduce, throttle={state.throttle} "
+                  f"(effective per bucket: min(throttle, world_size)={bstate.throttle})",
+                  flush=True)
+
+    def _work() -> None:
+        _direct_allreduce_sum(tensor, bstate)
+
+    return _submit_async_hook_work(
+        f"{dist.get_backend()}:direct_t{state.throttle}", tensor, _work)
+
+
+# Hook aliases: same algorithm on both backends.
+nccl_direct_allreduce_hook = _direct_allreduce_hook
+mpi_direct_allreduce_hook  = _direct_allreduce_hook
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# K-RING ALLREDUCE (Wilkins et al., CLUSTER'23, Sec. V-C/D, Fig. 6)
+#   g = p/k groups of k (node-aligned via hostnames). Each phase: k-1 intra-group
+#   ring steps + 1 inter-group step (G,j)->(G+1,j). p-1 steps total, same bytes
+#   as ring. RS = AG schedule reversed. k=1 and k=p are the plain ring.
+#   One code path for MPI and NCCL/RCCL: each step is one batch_isend_irecv.
+#   Names: "kring" (k = ranks per node) or "kring_k<N>".
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _kring_allgather_schedule(p: int, k: int, v: int) -> list:
+    """(is_inter, send_to, recv_from, send_block, recv_block) per step, virtual ranks."""
+    g = p // k
+    G, j = divmod(v, k)
+    steps = []
+    for h in range(g):
+        circ = (G - h) % g
+        for s in range(k - 1):
+            steps.append((False, G * k + (j + 1) % k, G * k + (j - 1) % k,
+                          circ * k + (j - s) % k, circ * k + (j - s - 1) % k))
+        if h < g - 1:
+            steps.append((True, ((G + 1) % g) * k + j, ((G - 1) % g) * k + j,
+                          circ * k + j, ((G - 1 - h) % g) * k + j))
+    return steps
+
+
+def _kring_reduce_scatter_schedule(p: int, k: int, v: int) -> list:
+    return [(inter, recv_from, send_to, recv_blk, send_blk)
+            for (inter, send_to, recv_from, send_blk, recv_blk)
+            in reversed(_kring_allgather_schedule(p, k, v))]
+
+
+@dataclass
+class KRingTopology:
+    world_size: int = 1
+    rank: int = 0
+    k: int = 1
+    ppn: Optional[int] = None
+    num_nodes: int = 1
+    node_aligned: bool = False
+    vrank: int = 0
+    v2r: List[int] = field(default_factory=list)
+    source: str = ""
+    note: str = ""
+
+
+def _kring_resolve_topology(k_req: int) -> KRingTopology:
+    """Collective (all_gather_object): call on ALL ranks, outside backward."""
+    t = KRingTopology()
+    t.world_size, t.rank = dist.get_world_size(), dist.get_rank()
+    p = t.world_size
+    try:
+        hosts = [None] * p
+        dist.all_gather_object(hosts, socket.gethostname())
+        order = list(dict.fromkeys(hosts))
+        node_ranks = [sorted(r for r in range(p) if hosts[r] == h) for h in order]
+        t.source = "hostnames"
+    except Exception as exc:
+        ppn_env = _ppn_from_env()
+        if ppn_env and p % ppn_env == 0:
+            node_ranks = [list(range(n * ppn_env, (n + 1) * ppn_env))
+                          for n in range(p // ppn_env)]
+            t.source = "env"
+        else:
+            node_ranks = [list(range(p))]
+            t.source = "identity"
+        t.note = f"hostname gather failed ({exc}); "
+    t.v2r = [r for nr in node_ranks for r in nr]
+    t.vrank = t.v2r.index(t.rank)
+    t.num_nodes = len(node_ranks)
+    sizes = {len(nr) for nr in node_ranks}
+    t.ppn = sizes.pop() if len(sizes) == 1 else None
+    k = k_req if k_req > 0 else (t.ppn or 1)
+    if k < 1 or p % k != 0:
+        t.note += f"k={k} does not divide world_size={p} → k=1; "
+        k = 1
+    t.k = k
+    t.node_aligned = t.ppn is not None and t.ppn % k == 0
+    if not t.node_aligned and k > 1:
+        t.note += "groups straddle nodes; "
+    return t
+
+
+@dataclass
+class KRingBucketState:
+    flat:       Optional[torch.Tensor] = None
+    tmp:        Optional[torch.Tensor] = None
+    numel:      int = 0
+    chunk:      int = 0
+    bucket_id:  int = 0
+    call_count: int = 0
+    stream:     Optional["torch.cuda.Stream"] = None
+
+    def initialize(self, tensor: torch.Tensor, world_size: int, bucket_id: int) -> None:
+        self.numel = tensor.numel()
+        self.chunk = max(1, math.ceil(self.numel / world_size))
+        self.flat = torch.zeros(world_size * self.chunk, dtype=tensor.dtype, device=tensor.device)
+        self.tmp = torch.empty(self.chunk, dtype=tensor.dtype, device=tensor.device)
+        self.bucket_id = bucket_id
+        self.stream = torch.cuda.Stream(device=tensor.device) if tensor.is_cuda else None
+
+
+@dataclass
+class KRingAllreduceState:
+    k_req: int = 0
+    topo: Optional[KRingTopology] = None
+    rs_steps: list = field(default_factory=list)
+    ag_steps: list = field(default_factory=list)
+    buckets: Dict[int, KRingBucketState] = field(default_factory=dict)
+    announced: bool = False
+
+    def resolve(self) -> None:
+        t = _kring_resolve_topology(self.k_req)
+        to_g = lambda steps: [(i, t.v2r[d], t.v2r[s], sb, rb) for (i, d, s, sb, rb) in steps]
+        self.rs_steps = to_g(_kring_reduce_scatter_schedule(t.world_size, t.k, t.vrank))
+        self.ag_steps = to_g(_kring_allgather_schedule(t.world_size, t.k, t.vrank))
+        self.topo = t
+
+    def get_or_init(self, bucket_index: int, tensor: torch.Tensor) -> KRingBucketState:
+        bs = self.buckets.get(bucket_index)
+        if bs is None or bs.numel != tensor.numel():
+            bs = KRingBucketState()
+            bs.initialize(tensor, self.topo.world_size, bucket_index)
+            self.buckets[bucket_index] = bs
+        return bs
+
+    def describe(self) -> str:
+        t = self.topo
+        n_inter = sum(1 for s in self.ag_steps if s[0])
+        return (f"p={t.world_size} k={t.k} groups={t.world_size // t.k} ppn={t.ppn} "
+                f"nodes={t.num_nodes} node_aligned={t.node_aligned} source={t.source} | "
+                f"per phase: {len(self.ag_steps) - n_inter} intra + {n_inter} inter steps"
+                + (f" | NOTE: {t.note}" if t.note else ""))
+
+
+def _kring_exchange(send_buf, dst, recv_buf, src, tag) -> None:
+    """One step, same call for MPI and NCCL/RCCL."""
+    reqs = dist.batch_isend_irecv([
+        dist.P2POp(dist.irecv, recv_buf, src, tag=tag),
+        dist.P2POp(dist.isend, send_buf, dst, tag=tag),
+    ])
+    for req in reqs:
+        req.wait()
+
+
+def _kring_allreduce_sum(tensor: torch.Tensor, state: KRingAllreduceState,
+                         bstate: KRingBucketState) -> None:
+    p = state.topo.world_size
+    if p == 1:
+        return
+    is_mpi = dist.get_backend() == "mpi"
+    n = bstate.numel
+    stream = bstate.stream if tensor.is_cuda else None
+    if stream is not None:
+        stream.wait_stream(torch.cuda.current_stream(device=tensor.device))
+    ctx = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
+
+    with ctx:
+        flat = bstate.flat
+        flat.narrow(0, 0, n).copy_(tensor.flatten())        # pad tail stays zero
+        chunks = flat.view(p, bstate.chunk)
+
+        _nvtx_range_push(f"kring_reduce_scatter:B{bstate.bucket_id} k={state.topo.k}")
+        for (_i, dst, src, sb, rb) in state.rs_steps:
+            tag = _next_tag()
+            if is_mpi:
+                _ring_sync(bstate, flat)        # GPU-direct RDMA bypasses stream order
+            _kring_exchange(chunks[sb], dst, bstate.tmp, src, tag)
+            chunks[rb].add_(bstate.tmp)
+        _nvtx_range_pop()
+
+        _nvtx_range_push(f"kring_allgather:B{bstate.bucket_id} k={state.topo.k}")
+        for (_i, dst, src, sb, rb) in state.ag_steps:
+            tag = _next_tag()
+            if is_mpi:
+                _ring_sync(bstate, flat)
+            _kring_exchange(chunks[sb], dst, chunks[rb], src, tag)
+        _nvtx_range_pop()
+
+        tensor.copy_(flat.narrow(0, 0, n).view_as(tensor))
+        tensor.div_(p)
+    _ring_sync(bstate, tensor)
+
+
+def _kring_allreduce_hook(state: KRingAllreduceState,
+                          bucket: dist.GradBucket) -> torch.futures.Future[torch.Tensor]:
+    tensor = bucket.buffer()
+    if state.topo is None:
+        state.resolve()                         # safety net; get_comm_hook resolves eagerly
+    if state.topo.world_size == 1:
+        fut = torch.futures.Future()
+        fut.set_result(tensor)
+        return fut
+    if not state.announced:
+        state.announced = True
+        if dist.get_rank() == 0:
+            print(f"[KRING] {state.describe()}", flush=True)
+    bstate = state.get_or_init(bucket.index(), tensor)
+    bstate.call_count += 1
+
+    def _work() -> None:
+        _kring_allreduce_sum(tensor, state, bstate)
+
+    return _submit_async_hook_work(f"{dist.get_backend()}:kring_k{state.topo.k}", tensor, _work)
+
+
+nccl_kring_allreduce_hook = _kring_allreduce_hook
+mpi_kring_allreduce_hook  = _kring_allreduce_hook
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HOOK FACTORY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_HOOK_REGISTRY = {
+    ("nccl", "default"):            nccl_default_allreduce_hook,
+    ("nccl", "ring"):               nccl_ring_allreduce_hook,
+    ("nccl", "ring_zfp_naive"):     nccl_ring_zfp_naive_allreduce_hook,
+    ("nccl", "recursive_doubling"): nccl_recursive_doubling_allreduce_hook,
+    ("nccl", "recursive_doubling_zfp_naive"): nccl_recursive_doubling_zfp_naive_allreduce_hook,
+    ("mpi",  "default"):            mpi_default_allreduce_hook,
+    ("mpi",  "ring"):               mpi_ring_allreduce_hook,
+    ("mpi",  "ring_zfp_naive"):     mpi_ring_zfp_naive_allreduce_hook,
+    ("mpi",  "recursive_doubling"): mpi_recursive_doubling_allreduce_hook,
+    ("mpi",  "recursive_doubling_zfp_naive"): mpi_recursive_doubling_zfp_naive_allreduce_hook,
+    ("mpi",  "ring_zfp_online_coll"): mpi_ring_zfp_online_coll_allreduce_hook,
+    ("mpi", "recursive_doubling_zfp_online_coll"): mpi_recursive_doubling_zfp_online_coll_allreduce_hook,
+    ("nccl", "ring_zfp_online_coll"): nccl_ring_zfp_online_coll_allreduce_hook,
+    ("nccl", "recursive_doubling_zfp_online_coll"): nccl_recursive_doubling_zfp_online_coll_allreduce_hook,
+    ("nccl", "default_sync"): nccl_default_sync_allreduce_hook,
+    ("nccl", "default_clone"): nccl_default_clone_allreduce_hook,
+    ("nccl", "default_cpu_stage"): nccl_default_cpu_stage_allreduce_hook,
+
+    ("mpi", "default_sync"): mpi_default_sync_allreduce_hook,
+    ("mpi", "default_clone"): mpi_default_clone_allreduce_hook,
+    ("mpi", "default_cpu_stage"): mpi_default_cpu_stage_allreduce_hook,
+    ("nccl", "direct"): nccl_direct_allreduce_hook,
+    ("mpi",  "direct"): mpi_direct_allreduce_hook,
+    ("nccl", "kring"):  nccl_kring_allreduce_hook,   # ← add
+    ("mpi",  "kring"):  mpi_kring_allreduce_hook,    # ← add
+    
+    ("nccl", "hierarchical_zfp_online_coll"): nccl_hier_zfp_online_coll_allreduce_hook,
+    ("mpi",  "hierarchical_zfp_online_coll"): mpi_hier_zfp_online_coll_allreduce_hook,
+}
+
+
+def get_comm_hook(
+    backend: str,
+    algorithm: Optional[str] = None,
+    zfp_rate: float = 16.0,
+) -> Optional[tuple]:
+    """
+    Return (hook, state) for DDP's register_comm_hook, or None.
+
+    Usage:
+        result = get_comm_hook(backend, algorithm)
+        if result is not None:
+            hook, state = result
+            model.register_comm_hook(state=state, hook=hook)
+    """
+    if algorithm is None:
+        return None
+    # "direct" (throttle from DDP_DIRECT_THROTTLE) or "direct_t<N>" (throttle N)
+    direct_throttle = None
+    kring_k = None 
+    if algorithm == "direct" or algorithm.startswith("direct_t"):
+        direct_throttle = (int(algorithm[len("direct_t"):])
+                           if algorithm.startswith("direct_t")
+                           else DIRECT_DEFAULT_THROTTLE)
+        key = (backend, "direct")
+    elif algorithm == "kring" or algorithm.startswith("kring_k"):   # ← add
+        kring_k = (int(algorithm[len("kring_k"):])
+                   if algorithm.startswith("kring_k") else 0)
+        key = (backend, "kring")
+    else:
+        key = (backend, algorithm)
+    if key not in _HOOK_REGISTRY:
+        available = [f"{b}/{a}" for b, a in _HOOK_REGISTRY]
+        raise ValueError(
+            f"Unknown hook: {backend}/{algorithm}. Available: {available}"
+        )
+    base_hook = _HOOK_REGISTRY[key]
+    
+    if direct_throttle is not None:
+        state = DirectAllreduceState(throttle=direct_throttle)
+    elif kring_k is not None:                                        # ← add
+        state = KRingAllreduceState(k_req=kring_k)
+        if dist.is_available() and dist.is_initialized():
+            state.resolve()  
+    elif algorithm == "ring":
+        state = RingAllreduceState()
+    elif algorithm == "ring_zfp_naive":
+        state = ZfpRingAllreduceState(rate=zfp_rate)
+    elif algorithm == "recursive_doubling":
+        state = RecursiveDoublingAllreduceState()
+    elif algorithm == "recursive_doubling_zfp_naive":
+        state = ZfpRecursiveDoublingAllreduceState(rate=zfp_rate)
+    elif algorithm == "hierarchical_zfp_online_coll":
+        state = (ZfpHierMpiAllreduceState(rate=zfp_rate) if backend == "mpi"
+                 else ZfpHierAllreduceState(rate=zfp_rate))
+        if backend == "mpi" and dist.is_available() and dist.is_initialized():
+            state.prepare()
+    # ── online_coll: NCCL/RCCL gets the hierarchical state, MPI keeps its own ──
+    elif algorithm in ("ring_zfp_online_coll",
+                       "recursive_doubling_zfp_online_coll"):
+        if backend in ("nccl", "rccl"):
+            state = ZfpHierAllreduceState(rate=zfp_rate)
+        elif algorithm == "ring_zfp_online_coll":
+            state = ZfpRingAllreduceState(rate=zfp_rate)
+        else:
+            state = ZfpRecursiveDoublingOnlineAllreduceState(rate=zfp_rate)
+    
+    else:
+        state = None
+
+    profile_label = f"{backend}:{algorithm}"
+    if "zfp" in algorithm:
+        profile_label = f"{profile_label}:rate{zfp_rate:g}"
+
+    def hook(state_obj, bucket):
+        return _profiled_hook(profile_label, base_hook, state_obj, bucket)
+
+    return hook, state
+
+
+def list_available_hooks() -> list:
+    return list(_HOOK_REGISTRY.keys())
